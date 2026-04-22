@@ -448,6 +448,7 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
                 embedding   = chunk_emb,
                 chunk_index = chunk["chunk_index"],
                 chunk_id    = chunk["chunk_id"],
+                uploaded_by = uploaded_by,
             )
             if chunk_emb:
                 store_chunk_embedding(chunk["chunk_id"], record_id, chunk_emb)
@@ -574,6 +575,33 @@ def reprocess(req: func.HttpRequest) -> func.HttpResponse:
 
 
 # ---------------------------------------------------------------------------
+# POST /backfill-uploaded-by — one-time migration to add uploaded_by to existing search index chunks
+# ---------------------------------------------------------------------------
+
+@app.route(route="backfill-uploaded-by", methods=["POST"])
+def backfill_uploaded_by_endpoint(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    One-time migration: reads all docs from Table Storage and patches
+    the search index chunks with the correct uploaded_by value.
+    """
+    logging.info("POST /backfill-uploaded-by")
+    try:
+        from services.table_service  import TableService
+        from services.search_service import backfill_uploaded_by
+
+        docs = TableService().list_documents()
+        doc_id_to_owner = {d["id"]: d["uploaded_by"] for d in docs if d.get("uploaded_by")}
+        updated = backfill_uploaded_by(doc_id_to_owner)
+        return func.HttpResponse(
+            json.dumps({"updated_chunks": updated, "docs_processed": len(doc_id_to_owner)}),
+            status_code=200, mimetype="application/json")
+    except Exception:
+        logging.exception("/backfill-uploaded-by error")
+        return func.HttpResponse(
+            json.dumps({"error": "Backfill failed"}),
+            status_code=500, mimetype="application/json")
+
+
 # GET /documents — list from Table Storage (lightweight, for UI polling)
 # ---------------------------------------------------------------------------
 
@@ -657,6 +685,19 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
             json.dumps({"error": "'q' is required."}),
             status_code=400, mimetype="application/json")
 
+    # Extract user identity from JWT for document isolation
+    uploaded_by = ""
+    auth_header = req.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        try:
+            import base64 as _b64
+            payload_b64 = auth_header.split(".")[1]
+            payload_b64 += "=" * (-len(payload_b64) % 4)
+            jwt_payload = json.loads(_b64.b64decode(payload_b64))
+            uploaded_by = jwt_payload.get("email") or jwt_payload.get("preferred_username") or ""
+        except Exception:
+            pass
+
     try:
         t0 = time.time()
 
@@ -664,6 +705,7 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
         result = run_rag_pipeline(
             query           = user_query,
             filename_filter = filename_filter,
+            uploaded_by     = uploaded_by,
             top_k           = 7,
             use_hyde        = True,
             use_compression = True,

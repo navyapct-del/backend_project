@@ -82,7 +82,8 @@ def ensure_index() -> None:
                 vector_search_dimensions = 1536,
                 vector_search_profile_name = "hnsw-profile",
             ),
-            SimpleField(name="blob_url",     type=SearchFieldDataType.String),
+            SimpleField(name="blob_url",      type=SearchFieldDataType.String),
+            SimpleField(name="uploaded_by",   type=SearchFieldDataType.String, filterable=True),
         ],
         vector_search = VectorSearch(
             algorithms = [HnswAlgorithmConfiguration(name="hnsw-algo")],
@@ -128,6 +129,7 @@ def index_document(
     embedding:   list[float] = None,
     chunk_index: int = 0,
     chunk_id:    str = "",
+    uploaded_by: str = "",
     retries:     int = 3,
 ) -> None:
     record_id = chunk_id or doc_id
@@ -139,6 +141,7 @@ def index_document(
         "content":     content[:32000],
         "summary":     summary,
         "blob_url":    blob_url,
+        "uploaded_by": uploaded_by,
     }
     if embedding:
         doc["embedding"] = embedding
@@ -159,6 +162,37 @@ def index_document(
     raise RuntimeError(f"Indexing failed for {record_id} after {retries} attempts")
 
 
+def backfill_uploaded_by(doc_id_to_owner: dict[str, str]) -> int:
+    """
+    Merge `uploaded_by` into existing search index documents.
+    doc_id_to_owner: { doc_id: uploaded_by_email }
+    Returns count of documents updated.
+    """
+    client = _get_search_client()
+    updated = 0
+    for doc_id, owner in doc_id_to_owner.items():
+        if not owner:
+            continue
+        # Search for all chunks belonging to this doc_id
+        try:
+            results = list(client.search(
+                search_text="*",
+                filter=f"doc_id eq '{doc_id}'",
+                select=["id"],
+                top=1000,
+            ))
+            if not results:
+                continue
+            patches = [{"id": r["id"], "uploaded_by": owner} for r in results]
+            client.merge_or_upload_documents(documents=patches)
+            updated += len(patches)
+            logging.info("backfill_uploaded_by: patched %d chunks for doc_id=%s owner=%s",
+                         len(patches), doc_id, owner)
+        except Exception as exc:
+            logging.warning("backfill_uploaded_by failed for doc_id=%s: %s", doc_id, exc)
+    return updated
+
+
 # ---------------------------------------------------------------------------
 # Hybrid search: vector + BM25 + semantic reranking + threshold filter
 # ---------------------------------------------------------------------------
@@ -168,6 +202,7 @@ def vector_search(
     query_text:      str,
     top:             int = _TOP_K,
     filename_filter: str = "",
+    uploaded_by:     str = "",
     min_score:       float = MIN_SCORE,
 ) -> list[dict]:
     """
@@ -203,6 +238,9 @@ def vector_search(
 
     if filename_filter:
         search_kwargs["filter"] = f"filename eq '{filename_filter}'"
+    elif uploaded_by:
+        safe = uploaded_by.replace("'", "''")
+        search_kwargs["filter"] = f"uploaded_by eq '{safe}'"
 
     try:
         results = list(_get_search_client().search(**search_kwargs))

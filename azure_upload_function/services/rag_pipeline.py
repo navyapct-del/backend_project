@@ -153,6 +153,7 @@ def multi_query_retrieve(
     query: str,
     top_k: int = 7,
     filename_filter: str = "",
+    uploaded_by: str = "",
     use_hyde: bool = True,
 ) -> list[dict]:
     """
@@ -189,6 +190,7 @@ def multi_query_retrieve(
             query_text      = q_variant,
             top             = top_k,
             filename_filter = filename_filter,
+            uploaded_by     = uploaded_by,
         )
         for chunk in chunks:
             cid = chunk["id"]
@@ -205,6 +207,7 @@ def multi_query_retrieve(
                 query_text      = query,
                 top             = top_k,
                 filename_filter = filename_filter,
+                uploaded_by     = uploaded_by,
             )
         return []
 
@@ -606,6 +609,7 @@ _CACHE_TTL_SECS = 1800  # 30 minutes
 def run_rag_pipeline(
     query:           str,
     filename_filter: str = "",
+    uploaded_by:     str = "",
     top_k:           int = 7,
     use_hyde:        bool = True,
     use_compression: bool = True,
@@ -632,6 +636,7 @@ def run_rag_pipeline(
         query           = query,
         top_k           = top_k,
         filename_filter = filename_filter,
+        uploaded_by     = uploaded_by,
         use_hyde        = use_hyde,
     )
 
