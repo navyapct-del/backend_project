@@ -45,7 +45,7 @@ class TableService:
     # ------------------------------------------------------------------
 
     def insert_entity(self, filename: str, blob_url: str, description: str, tags: str,
-                      temp: bool = False, session_id: str = "") -> str:
+                      temp: bool = False, session_id: str = "", uploaded_by: str = "") -> str:
         row_key = str(uuid.uuid4())
         entity  = {
             "PartitionKey":   PARTITION_KEY,
@@ -62,6 +62,7 @@ class TableService:
             "created_at":     datetime.now(timezone.utc).isoformat(),
             "temp":           temp,
             "session_id":     session_id[:100] if session_id else "",
+            "uploaded_by":    uploaded_by[:200] if uploaded_by else "",
         }
         try:
             self._client.create_entity(entity=entity)
@@ -450,16 +451,17 @@ class TableService:
         try:
             entities = list(self._client.query_entities(
                 query_filter=f"PartitionKey eq '{PARTITION_KEY}'",
-                select=["RowKey", "filename", "summary", "tags", "blob_url", "status", "created_at", "temp"],
+                select=["RowKey", "filename", "summary", "tags", "blob_url", "status", "created_at", "temp", "uploaded_by"],
             ))
             docs = [{
-                "id":         e.get("RowKey", ""),
-                "filename":   e.get("filename", ""),
-                "summary":    e.get("summary", ""),
-                "tags":       e.get("tags", ""),
-                "blob_url":   e.get("blob_url", ""),
-                "status":     e.get("status", "processing"),
-                "created_at": e.get("created_at", ""),
+                "id":          e.get("RowKey", ""),
+                "filename":    e.get("filename", ""),
+                "summary":     e.get("summary", ""),
+                "tags":        e.get("tags", ""),
+                "blob_url":    e.get("blob_url", ""),
+                "status":      e.get("status", "processing"),
+                "created_at":  e.get("created_at", ""),
+                "uploaded_by": e.get("uploaded_by", ""),
             } for e in entities
               if not e.get("temp", False)]   # exclude temp uploads from Files Knowledge Bot
             docs.sort(key=lambda d: d["created_at"], reverse=True)
@@ -467,6 +469,32 @@ class TableService:
             return docs
         except Exception as exc:
             logging.error("list_documents failed: %s", exc)
+            return []
+
+    def list_documents_by_user(self, uploaded_by: str) -> list[dict]:
+        t0 = time.time()
+        try:
+            safe = uploaded_by.replace("'", "''")
+            entities = list(self._client.query_entities(
+                query_filter=f"PartitionKey eq '{PARTITION_KEY}' and uploaded_by eq '{safe}'",
+                select=["RowKey", "filename", "summary", "tags", "blob_url", "status", "created_at", "uploaded_by"],
+            ))
+            docs = [{
+                "id":          e.get("RowKey", ""),
+                "filename":    e.get("filename", ""),
+                "summary":     e.get("summary", ""),
+                "tags":        e.get("tags", ""),
+                "blob_url":    e.get("blob_url", ""),
+                "status":      e.get("status", "processing"),
+                "created_at":  e.get("created_at", ""),
+                "uploaded_by": e.get("uploaded_by", ""),
+            } for e in entities
+              if not e.get("temp", False)]
+            docs.sort(key=lambda d: d["created_at"], reverse=True)
+            logging.info("list_documents_by_user(%s): %d docs in %.3fs", uploaded_by, len(docs), time.time() - t0)
+            return docs
+        except Exception as exc:
+            logging.error("list_documents_by_user failed: %s", exc)
             return []
 
 

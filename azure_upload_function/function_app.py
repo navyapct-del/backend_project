@@ -230,6 +230,21 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
         temp_flag   = req.form.get("temp", "false").lower() == "true"
         session_id  = req.form.get("session_id", "")
 
+        # Extract uploader identity from JWT (preferred) or form field fallback
+        uploaded_by = ""
+        auth_header = req.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            try:
+                import base64 as _b64
+                payload_b64 = auth_header.split(".")[1]
+                payload_b64 += "=" * (-len(payload_b64) % 4)
+                jwt_payload = json.loads(_b64.b64decode(payload_b64))
+                uploaded_by = jwt_payload.get("email") or jwt_payload.get("preferred_username") or ""
+            except Exception:
+                pass
+        if not uploaded_by:
+            uploaded_by = req.form.get("uploaded_by", "")
+
         if not filename:
             return func.HttpResponse(json.dumps({"error": "filename is required."}),
                                      status_code=400, mimetype="application/json")
@@ -315,7 +330,8 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
         # ── 2. Table Storage placeholder (status=processing) ──────────────
         table_svc = TableService()
         record_id = table_svc.insert_entity(filename, blob_url, description, tags_input,
-                                            temp=temp_flag, session_id=session_id)
+                                            temp=temp_flag, session_id=session_id,
+                                            uploaded_by=uploaded_by)
 
         # ── 3. Text extraction (universal — PDF, CSV, Excel, Word, TXT, Image) ──
         t0   = time.time()
@@ -565,7 +581,9 @@ def reprocess(req: func.HttpRequest) -> func.HttpResponse:
 def documents(req: func.HttpRequest) -> func.HttpResponse:
     t0 = time.time()
     try:
-        docs = TableService().list_documents()
+        uploaded_by = req.params.get("uploaded_by", "").strip()
+        svc = TableService()
+        docs = svc.list_documents_by_user(uploaded_by) if uploaded_by else svc.list_documents()
         logging.info("/documents: %d docs in %.3fs", len(docs), time.time() - t0)
         return func.HttpResponse(json.dumps(docs), status_code=200, mimetype="application/json")
     except Exception as exc:
