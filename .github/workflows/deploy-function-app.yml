@@ -1,0 +1,31 @@
+name: Deploy Function App
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "azure_upload_function/**"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: azure_upload_function
+        run: pip install -r requirements.txt --target=".python_packages/lib/site-packages"
+
+      - name: Deploy to Azure Function App
+        uses: Azure/functions-action@v1
+        with:
+          app-name: dataocrhfunapp
+          package: azure_upload_function
+          publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
+          scm-do-build-during-deployment: true
+          enable-oryx-build: true

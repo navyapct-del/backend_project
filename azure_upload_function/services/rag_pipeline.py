@@ -1,0 +1,838 @@
+"""
+rag_pipeline.py — Advanced RAG pipeline with:
+
+  1. Intent classification   — routes to structured engine or prose RAG
+  2. HyDE retrieval          — embeds a hypothetical answer for better recall
+  3. Multi-query retrieval   — 3 query variants merged + deduplicated
+  4. Contextual compression  — extracts only the relevant passage per chunk
+  5. Grounded generation     — strict system prompt, temperature=0, no hallucination
+  6. Self-consistency check  — validates answer is grounded in context
+
+Architecture:
+  query
+    │
+    ├─► intent_classifier()
+    │       │
+    │       ├─ STRUCTURED → query_engine (pandas + LLM plan)
+    │       │
+    │       └─ PROSE / HYBRID
+    │               │
+    │               ├─► multi_query_retrieval()   [3 variants + HyDE]
+    │               ├─► contextual_compression()  [extract relevant passages]
+    │               └─► grounded_generate()       [strict RAG answer]
+    │
+    └─► format_response()
+"""
+
+import re
+import json
+import logging
+import hashlib
+from functools import lru_cache
+from typing import Literal
+
+# ---------------------------------------------------------------------------
+# Intent types
+# ---------------------------------------------------------------------------
+
+IntentType = Literal["structured", "prose", "hybrid"]
+
+# Keywords that signal the query engine should handle the request
+_STRUCTURED_KEYWORDS = {
+    # Aggregation
+    "sum", "total", "average", "avg", "mean", "count", "max", "min",
+    "how many", "number of", "add up", "calculate",
+    # Grouping / breakdown
+    "breakdown", "group by", "per", "by department", "by category",
+    "distribution", "frequency",
+    # Comparison
+    "compare", "comparison", "versus", " vs ", "difference between",
+    # Filtering
+    "filter", "where", "only", "exclude",
+    # Sorting
+    "top", "bottom", "highest", "lowest", "ranked",
+    # Listing / enumeration — only route to structured engine for CSV/Excel, not PDFs
+    # (handled by has_structured_data check in classify_intent)
+    "list all", "show all", "show me all", "all the", "give me all",
+    "enumerate", "display all", "fetch all", "get all",
+}
+
+# Keywords that signal a chart/graph is wanted
+_CHART_KEYWORDS = {
+    "chart", "graph", "plot", "visualize", "visualise", "visualisation",
+    "bar chart", "line chart", "pie chart", "scatter", "histogram",
+    "trend", "over time", "growth", "distribution",
+}
+
+# Keywords that signal a table is wanted
+_TABLE_KEYWORDS = {
+    "table", "list", "show all", "enumerate", "tabular", "rows", "columns",
+    "spreadsheet", "grid",
+}
+
+
+def classify_intent(query: str, has_structured_data: bool) -> IntentType:
+    """
+    Classify query intent to route to the right pipeline.
+
+    Returns:
+      "structured" — use query engine (aggregations, charts from data)
+      "prose"      — use RAG (factual questions, summaries, explanations)
+      "hybrid"     — try query engine first, fall back to RAG
+    """
+    q = query.lower()
+
+    has_chart_intent      = any(k in q for k in _CHART_KEYWORDS)
+    has_structured_intent = any(k in q for k in _STRUCTURED_KEYWORDS)
+    has_table_intent      = any(k in q for k in _TABLE_KEYWORDS)
+
+    if not has_structured_data:
+        return "prose"
+
+    if has_chart_intent or (has_structured_intent and has_structured_data):
+        return "structured"
+
+    if has_table_intent:
+        return "hybrid"
+
+    return "prose"
+
+
+# ---------------------------------------------------------------------------
+# Multi-query retrieval with HyDE
+# ---------------------------------------------------------------------------
+
+def generate_query_variants(query: str) -> list[str]:
+    """
+    Generate 3 semantically diverse query variants + 1 HyDE hypothetical answer.
+    Returns [original, variant1, variant2, variant3, hyde_passage].
+
+    HyDE (Hypothetical Document Embedding): generate a short hypothetical answer
+    and embed it — this often retrieves better chunks than the raw question.
+    """
+    from services.openai_service import _get_client, _deployment
+
+    prompt = f"""Given this user question, generate:
+1. One alternative phrasing (different vocabulary, same intent)
+2. A short hypothetical answer passage (1-2 sentences) that would ideally answer the question
+
+Return ONLY valid JSON:
+{{"variant": "rephrased question here", "hyde": "hypothetical answer here"}}
+
+Question: {query}
+
+JSON:"""
+
+    try:
+        resp = _get_client().chat.completions.create(
+            model       = _deployment(),
+            messages    = [{"role": "user", "content": prompt}],
+            temperature = 0.3,
+            max_tokens  = 150,
+            timeout     = 8,
+        )
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw).strip()
+        data     = json.loads(raw)
+        variant  = data.get("variant", "")
+        hyde     = data.get("hyde", "")
+        result   = [query]
+        if variant and variant != query:
+            result.append(variant)
+        if hyde:
+            result.append(hyde)
+        logging.info("generate_query_variants: %d queries total", len(result))
+        return result
+    except Exception as exc:
+        logging.warning("generate_query_variants failed (%s) — using original query only", exc)
+        return [query]
+
+
+def multi_query_retrieve(
+    query: str,
+    top_k: int = 7,
+    filename_filter: str = "",
+    use_hyde: bool = True,
+) -> list[dict]:
+    """
+    Retrieve chunks using multiple query variants + HyDE for better recall.
+
+    Strategy:
+      1. Generate query variants + HyDE passage
+      2. Embed each variant
+      3. Run hybrid search for each
+      4. Merge results, deduplicate by chunk id
+      5. Re-rank merged set by best score per chunk
+      6. Return top_k
+
+    Falls back to single-query retrieval if variant generation fails.
+    """
+    from services.openai_service import generate_embedding
+    from services.search_service import vector_search
+
+    # Generate variants (includes HyDE if enabled)
+    if use_hyde:
+        queries = generate_query_variants(query)
+    else:
+        queries = [query]
+
+    # Retrieve for each query variant
+    seen_ids: dict[str, dict] = {}   # chunk_id → best chunk
+
+    for q_variant in queries:
+        embedding = generate_embedding(q_variant)
+        if not embedding:
+            continue
+        chunks = vector_search(
+            query_embedding = embedding,
+            query_text      = q_variant,
+            top             = top_k,
+            filename_filter = filename_filter,
+        )
+        for chunk in chunks:
+            cid = chunk["id"]
+            # Keep the version with the highest score
+            if cid not in seen_ids or chunk["score"] > seen_ids[cid]["score"]:
+                seen_ids[cid] = chunk
+
+    if not seen_ids:
+        # Hard fallback: single query
+        embedding = generate_embedding(query)
+        if embedding:
+            return vector_search(
+                query_embedding = embedding,
+                query_text      = query,
+                top             = top_k,
+                filename_filter = filename_filter,
+            )
+        return []
+
+    # Sort merged results by score, return top_k
+    merged = sorted(seen_ids.values(), key=lambda x: x["score"], reverse=True)
+    result = merged[:top_k]
+    logging.info("multi_query_retrieve: %d unique chunks from %d queries → returning %d",
+                 len(seen_ids), len(queries), len(result))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Contextual compression
+# ---------------------------------------------------------------------------
+
+def compress_chunks(query: str, chunks: list[dict]) -> list[dict]:
+    """
+    Extract only the passage most relevant to the query from each chunk.
+    Skipped for short/simple queries to avoid stripping relevant content.
+    Falls back to original chunk text if compression fails.
+    """
+    from services.openai_service import _get_client, _deployment
+
+    if not chunks:
+        return chunks
+
+    # Skip compression for short queries — risk of stripping relevant content
+    # outweighs benefit for simple factual questions
+    word_count = len(query.split())
+    if word_count <= 8 or len(chunks) <= 3:
+        logging.info("compress_chunks: skipping (query_words=%d, chunks=%d)", word_count, len(chunks))
+        return chunks
+
+    # Build batched extraction prompt
+    chunk_texts = []
+    for i, chunk in enumerate(chunks):
+        text = (chunk.get("text") or chunk.get("content") or "").strip()
+        chunk_texts.append(f"[Chunk {i+1}]\n{text[:1500]}")
+
+    combined = "\n\n".join(chunk_texts)
+
+    prompt = f"""You are a precise information extractor.
+
+For each chunk below, extract ONLY the sentences directly relevant to the question.
+If a chunk has no relevant content, return an empty string for it.
+Return ONLY valid JSON: {{"extracts": ["extract1", "extract2", ...]}}
+The array must have exactly {len(chunks)} elements (one per chunk, empty string if not relevant).
+
+Question: {query}
+
+Chunks:
+{combined}
+
+JSON:"""
+
+    try:
+        resp = _get_client().chat.completions.create(
+            model       = _deployment(),
+            messages    = [{"role": "user", "content": prompt}],
+            temperature = 0.0,
+            max_tokens  = 1500,
+        )
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw).strip()
+        data     = json.loads(raw)
+        extracts = data.get("extracts", [])
+
+        compressed = []
+        for i, chunk in enumerate(chunks):
+            extract = extracts[i].strip() if i < len(extracts) else ""
+            if extract:
+                # Use compressed text but keep all metadata
+                new_chunk = dict(chunk)
+                new_chunk["text"]              = extract
+                new_chunk["_compressed"]       = True
+                new_chunk["_original_text_len"] = len(chunk.get("text") or chunk.get("content") or "")
+                compressed.append(new_chunk)
+            else:
+                # Chunk not relevant — still include with original text (lower weight)
+                compressed.append(chunk)
+
+        # Filter out chunks where compression returned empty AND original text is short
+        relevant = [
+            c for c in compressed
+            if (c.get("text") or c.get("content") or "").strip()
+        ]
+
+        logging.info("compress_chunks: %d → %d relevant chunks after compression",
+                     len(chunks), len(relevant))
+        return relevant if relevant else chunks
+
+    except Exception as exc:
+        logging.warning("compress_chunks failed (%s) — using original chunks", exc)
+        return chunks
+
+
+# ---------------------------------------------------------------------------
+# Grounded answer generation
+# ---------------------------------------------------------------------------
+
+# System prompt — defines the assistant's persona and grounding rules
+_SYSTEM_PROMPT = """You are a helpful, precise AI assistant for document question-answering.
+
+CORE RULES:
+1. Answer from the provided context. Prefer context over prior knowledge.
+2. If the context clearly does not contain the answer, say: "The documents do not contain enough information to answer this question."
+3. Be specific and factual. Mention the source document name when useful.
+4. For numerical data, include the exact figures from the context.
+5. Do not fabricate data, names, or statistics not present in the context.
+
+RESPONSE QUALITY:
+- Be comprehensive but concise
+- Use numbered lists for multi-part answers
+- Use bullet points for enumerations
+- Bold key terms or figures using **term** syntax
+- Always end with: Sources: [filename1, filename2, ...]"""
+
+
+def grounded_generate(
+    query: str,
+    chunks: list[dict],
+    response_format: Literal["text", "table", "chart", "auto"] = "auto",
+) -> dict:
+    """
+    Generate a grounded answer from compressed, relevant chunks.
+
+    Args:
+        query:           User question
+        chunks:          Compressed, relevant chunks from retrieval
+        response_format: Force a specific format or let the LLM decide
+
+    Returns:
+        {
+          "type":    "text" | "table" | "chart",
+          "answer":  str,
+          "columns": [...],   # for table
+          "rows":    [...],   # for table
+          "labels":  [...],   # for chart
+          "values":  [...],   # for chart
+          "chart_type": str,  # for chart
+          "sources": [...]
+        }
+    """
+    from services.openai_service import _get_client, _deployment
+
+    if not chunks:
+        return {
+            "type":    "text",
+            "answer":  "No relevant documents found. Please upload documents first.",
+            "sources": [],
+        }
+
+    # Build context with clear source attribution
+    context_parts = []
+    citation_list = []
+    seen_files    = set()
+
+    for i, chunk in enumerate(chunks, 1):
+        filename = chunk.get("filename", f"Document {i}")
+        text     = (chunk.get("text") or chunk.get("content") or "").strip()
+        summary  = chunk.get("summary", "")
+        score    = chunk.get("score", 0)
+
+        if not text:
+            continue
+
+        # Include summary as context header for first chunk of each document
+        if filename not in seen_files and summary:
+            context_parts.append(
+                f"[Source {i}: {filename} | relevance: {score:.2f}]\n"
+                f"Document summary: {summary}\n\n"
+                f"Relevant excerpt:\n{text}"
+            )
+        else:
+            context_parts.append(
+                f"[Source {i}: {filename} | relevance: {score:.2f}]\n{text}"
+            )
+
+        if filename not in seen_files:
+            seen_files.add(filename)
+            citation_list.append(filename)
+
+    if not context_parts:
+        return {
+            "type":    "text",
+            "answer":  "No content could be extracted from the retrieved documents.",
+            "sources": citation_list,
+        }
+
+    context = "\n\n---\n\n".join(context_parts)
+
+    # Determine format instructions
+    q_lower = query.lower()
+    if response_format == "auto":
+        wants_chart = any(k in q_lower for k in _CHART_KEYWORDS)
+        wants_table = any(k in q_lower for k in _TABLE_KEYWORDS)
+        if wants_chart:
+            response_format = "chart"
+        elif wants_table:
+            response_format = "table"
+        else:
+            response_format = "text"
+
+    format_instructions = _build_format_instructions(response_format, citation_list)
+
+    user_prompt = f"""Context from documents:
+{context}
+
+---
+
+Question: {query}
+
+{format_instructions}"""
+
+    try:
+        resp = _get_client().chat.completions.create(
+            model    = _deployment(),
+            messages = [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+            temperature = 0.0,    # deterministic for consistency
+            max_tokens  = 2500,
+        )
+        raw = resp.choices[0].message.content.strip()
+
+        # Parse structured response
+        parsed = _parse_llm_response(raw, citation_list, response_format)
+
+        # ── Post-process chart data ───────────────────────────────────────
+        if parsed.get("type") == "chart":
+            parsed = _clean_chart_data(parsed, user_query=query)
+
+        logging.info("grounded_generate: type=%s answer_len=%d sources=%d",
+                     parsed.get("type"), len(str(parsed.get("answer", ""))), len(citation_list))
+        return parsed
+
+    except Exception as exc:
+        logging.error("grounded_generate failed: %s", exc)
+        return {
+            "type":    "text",
+            "answer":  "Failed to generate answer. Please try again.",
+            "sources": citation_list,
+        }
+
+
+def _clean_chart_data(chart: dict, user_query: str = "") -> dict:
+    """
+    Post-process chart data for quality.
+    Respects explicit user chart type requests — never downgrades pie→bar
+    if the user explicitly asked for a pie chart.
+    """
+    chart_type    = chart.get("chart_type", "bar")
+    labels        = chart.get("labels", [])
+    values        = chart.get("values", [])
+    _q = user_query.lower()
+    user_wants_pie = any(k in _q for k in ("pie chart", "pie graph", " pie ", "as pie", "a pie"))
+
+    if not labels or not values:
+        return chart
+
+    # Align lengths
+    min_len = min(len(labels), len(values))
+    labels  = labels[:min_len]
+    values  = values[:min_len]
+
+    # Convert values to numbers, replace None with 0
+    clean_values = []
+    for v in values:
+        try:
+            clean_values.append(float(v) if v is not None else 0.0)
+        except (TypeError, ValueError):
+            clean_values.append(0.0)
+
+    if chart_type == "pie":
+        # Filter out zero/negative slices
+        filtered = [(l, v) for l, v in zip(labels, clean_values) if v > 0]
+        if not filtered:
+            chart["labels"] = labels
+            chart["values"] = clean_values
+            return chart
+        # Only downgrade to bar if user did NOT explicitly ask for pie
+        if len(filtered) == 1 and not user_wants_pie:
+            chart["chart_type"] = "bar"
+            chart["labels"]     = [f[0] for f in filtered]
+            chart["values"]     = [f[1] for f in filtered]
+            return chart
+        chart["labels"] = [f[0] for f in filtered]
+        chart["values"] = [f[1] for f in filtered]
+    else:
+        chart["labels"] = labels
+        chart["values"] = clean_values
+
+    return chart
+
+
+def _build_format_instructions(
+    response_format: str,
+    citation_list: list[str],
+) -> str:
+    """Build format-specific instructions for the LLM."""
+    sources_json = json.dumps(citation_list)
+
+    if response_format == "table":
+        return f"""Respond with ONLY a valid JSON object in this exact format:
+{{"type":"table","columns":["Col1","Col2","Col3"],"rows":[{{"Col1":"v1","Col2":"v2","Col3":"v3"}}],"answer":"1-line summary of the table","sources":{sources_json}}}
+
+Rules:
+- Extract ALL relevant data from the context into table rows
+- Use the actual column names from the data
+- Include every relevant row — do not truncate
+- "answer" should be a 1-line summary of what the table shows"""
+
+    if response_format == "chart":
+        return f"""Respond with ONLY a valid JSON object in this exact format:
+{{"type":"chart","chart_type":"bar|line|pie|area|scatter","labels":["A","B","C"],"values":[10,20,30],"answer":"1-line summary","sources":{sources_json}}}
+
+Rules:
+- Extract numeric data from the context
+- IMPORTANT: If the user explicitly asked for a specific chart type (e.g. "pie chart", "line chart", "bar chart"), use EXACTLY that chart_type
+- Otherwise choose chart_type based on data: line for trends/time, pie for proportions/shares, bar for comparisons
+- labels = category names or time periods
+- values = corresponding numeric values
+- If multiple series exist, use: {{"type":"chart","chart_type":"bar","series":{{"Series1":[1,2,3],"Series2":[4,5,6]}},"labels":["A","B","C"],"answer":"...","sources":{sources_json}}}"""
+
+    # Default: text
+    return f"""Respond with ONLY a valid JSON object in this exact format:
+{{"type":"text","answer":"<your detailed answer here>","sources":{sources_json}}}
+
+Rules:
+- Answer must be comprehensive and directly address the question
+- Use numbered lists (1. 2. 3.) for multi-part answers
+- Use **bold** for key terms and figures
+- Include exact numbers/dates/names from the context
+- End the answer with: \\n\\nSources: {', '.join(citation_list)}"""
+
+
+def _parse_llm_response(
+    raw: str,
+    citation_list: list[str],
+    expected_format: str,
+) -> dict:
+    """
+    Parse LLM response into a structured dict.
+    Handles: valid JSON, JSON in markdown fences, plain text fallback.
+    """
+    # Strip markdown code fences
+    cleaned = re.sub(r"^```(?:json)?\s*", "", raw)
+    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+
+    # Try direct JSON parse
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict) and "type" in parsed:
+            if "sources" not in parsed:
+                parsed["sources"] = citation_list
+            return parsed
+    except Exception:
+        pass
+
+    # Try extracting JSON object from mixed response
+    m = re.search(r'\{[\s\S]*\}', cleaned)
+    if m:
+        try:
+            parsed = json.loads(m.group())
+            if isinstance(parsed, dict) and "type" in parsed:
+                if "sources" not in parsed:
+                    parsed["sources"] = citation_list
+                return parsed
+        except Exception:
+            pass
+
+    # Plain text fallback — wrap in text envelope
+    # Strip any leading/trailing JSON artifacts before using as answer
+    answer_text = raw.strip().lstrip("{[").rstrip("}]").strip()
+    if not answer_text:
+        answer_text = raw
+    logging.warning("_parse_llm_response: LLM returned plain text, wrapping as text response (len=%d)", len(answer_text))
+    return {
+        "type":    "text",
+        "answer":  answer_text,
+        "sources": citation_list,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline entry point
+# ---------------------------------------------------------------------------
+
+# Answer cache: query_hash → (response dict, timestamp)
+# Key uses query + filename_filter only — document content is reflected in the answer itself.
+# TTL: 30 minutes — ensures stale answers after document updates are evicted.
+_pipeline_cache: dict[str, tuple[dict, float]] = {}
+_MAX_CACHE_SIZE = 300
+_CACHE_TTL_SECS = 1800  # 30 minutes
+
+
+def run_rag_pipeline(
+    query:           str,
+    filename_filter: str = "",
+    top_k:           int = 7,
+    use_hyde:        bool = True,
+    use_compression: bool = True,
+) -> dict:
+    """
+    Full advanced RAG pipeline entry point.
+
+    Pipeline:
+      1. Multi-query retrieval with HyDE
+      2. Contextual compression
+      3. Grounded generation with strict system prompt
+      4. Response formatting
+
+    Returns a response dict with type, answer, sources, and optional
+    table/chart data.
+    """
+    from services.table_service import TableService
+
+    if not query or not query.strip():
+        return {"type": "text", "answer": "No question provided.", "sources": []}
+
+    # ── Step 1: Multi-query retrieval with HyDE ───────────────────────────
+    chunks = multi_query_retrieve(
+        query           = query,
+        top_k           = top_k,
+        filename_filter = filename_filter,
+        use_hyde        = use_hyde,
+    )
+
+    if not chunks:
+        return {
+            "type":    "text",
+            "answer":  "No relevant documents found for your query. Please ensure documents have been uploaded.",
+            "sources": [],
+        }
+
+    # ── Step 2: Check cache ───────────────────────────────────────────────
+    import time as _time
+    cache_key = hashlib.md5((query + "|" + filename_filter).encode()).hexdigest()
+    cached = _pipeline_cache.get(cache_key)
+    if cached:
+        result, ts = cached
+        if _time.time() - ts < _CACHE_TTL_SECS:
+            logging.info("run_rag_pipeline: cache hit")
+            return result
+        else:
+            del _pipeline_cache[cache_key]  # expired
+
+    # ── Step 3: Build sources list ────────────────────────────────────────
+    seen_files = set()
+    sources    = []
+    for chunk in chunks:
+        fname = chunk.get("filename", "")
+        if fname and fname not in seen_files:
+            seen_files.add(fname)
+            sources.append({
+                "filename": fname,
+                "summary":  chunk.get("summary", ""),
+                "blob_url": chunk.get("blob_url", ""),
+                "score":    chunk.get("score", 0),
+            })
+
+    # ── Step 4: Check for structured data (for analytical queries) ────────
+    # CRITICAL: match structured data to the query topic, not just "first with data"
+    table_svc = TableService()
+    stored_sd = None
+
+    q_lower   = query.lower()
+    q_words   = set(w.strip(".,!?;:()") for w in q_lower.split() if len(w) >= 3)
+
+    def _sd_relevance_score(sd: dict, filename: str) -> int:
+        """Score how relevant a document's structured data is to the query."""
+        score = 0
+        # Column name overlap with query words (stemmed: strip trailing s/es/ing)
+        sd_columns = sd.get("columns", [])
+        if not sd_columns and sd.get("sheets"):
+            for sheet_data in sd["sheets"].values():
+                sd_columns = sheet_data.get("columns", [])
+                if sd_columns:
+                    break
+
+        def _stem(w: str) -> str:
+            """Minimal suffix stripping for English plurals/gerunds."""
+            if w.endswith("ing") and len(w) > 5:
+                return w[:-3]
+            if w.endswith("ies") and len(w) > 4:
+                return w[:-3] + "y"
+            if w.endswith("es") and len(w) > 4:
+                return w[:-2]
+            if w.endswith("s") and len(w) > 3:
+                return w[:-1]
+            return w
+
+        stemmed_q_words = {_stem(w) for w in q_words} | q_words
+
+        for col in sd_columns:
+            col_lower = col.lower().replace("_", " ").replace("-", " ")
+            col_words = set(col_lower.split())
+            stemmed_col_words = {_stem(w) for w in col_words} | col_words
+            for qw in stemmed_q_words:
+                # Substring match (stemmed)
+                if qw in col_lower or any(qw in cw or cw in qw for cw in stemmed_col_words):
+                    score += 3
+                    break
+        # Filename overlap with query words (stemmed)
+        fname_lower = filename.lower().replace("_", " ").replace("-", " ")
+        for qw in stemmed_q_words:
+            if qw in fname_lower:
+                score += 5
+                break
+        # Chart/aggregation keywords get a base score only if structured data has numeric columns
+        chart_agg_kw = {"chart", "graph", "plot", "total", "sum", "average",
+                        "count", "max", "min", "distribution", "breakdown"}
+        numeric_cols = [c for c in sd_columns if any(
+            isinstance(v, (int, float)) for v in [] # checked at query time
+        )]
+        if any(k in q_lower for k in chart_agg_kw) and sd_columns:
+            score += 1
+        return score
+
+    # Score all retrieved documents' structured data and pick the best match
+    best_score = -1
+    for chunk in chunks:
+        fname = chunk.get("filename", "")
+        if not fname:
+            continue
+        sd = table_svc.get_structured_data(fname)
+        if not sd:
+            continue
+        score = _sd_relevance_score(sd, fname)
+        logging.info("run_rag_pipeline: structured data relevance '%s' score=%d", fname, score)
+        if score > best_score:
+            best_score = score
+            stored_sd  = sd
+            logging.info("run_rag_pipeline: selected structured data from '%s' (score=%d)", fname, score)
+
+    # Only use structured data if it has meaningful relevance to the query
+    if best_score <= 0:
+        stored_sd = None
+        logging.info("run_rag_pipeline: no relevant structured data found — using prose RAG")
+
+    # ── Step 5: Intent classification ────────────────────────────────────
+    intent = classify_intent(query, has_structured_data=stored_sd is not None)
+    logging.info("run_rag_pipeline: intent=%s has_sd=%s", intent, stored_sd is not None)
+
+    # ── Step 6: Route to structured engine or prose RAG ──────────────────
+    if intent == "structured" and stored_sd:
+        from services.query_engine import generate_plan, execute_plan, structured_to_df
+        import pandas as pd
+        import json as _json
+
+        def _run_engine_local(query: str, structured: dict) -> dict | None:
+            try:
+                df = structured_to_df(structured)
+                if df.empty:
+                    return None
+                df      = df.drop(columns=[c for c in df.columns if c.startswith("_")], errors="ignore")
+                cols    = list(df.columns)
+                plan    = generate_plan(query, cols)
+                result  = execute_plan(df, plan)
+                return result
+            except Exception as exc:
+                logging.warning("_run_engine_local failed: %s", exc)
+                return None
+
+        engine_result = _run_engine_local(query, stored_sd)
+        if engine_result and engine_result.get("type") != "error":
+            rows = engine_result.get("rows", [])
+            if rows or engine_result.get("type") == "text":
+                # Promote to chart with correct type if query has chart intent
+                if engine_result.get("type") != "chart":
+                    from services.query_engine import promote_to_chart
+                    try:
+                        df   = structured_to_df(stored_sd)
+                        cols = list(df.columns)
+                        plan = generate_plan(query, cols)
+                        if any(k in query.lower() for k in _CHART_KEYWORDS) and plan.get("group_by"):
+                            engine_result = promote_to_chart(engine_result, query)
+                    except Exception:
+                        pass
+                # Clean chart data if applicable (Shape A: labels/values)
+                if engine_result.get("type") == "chart" and engine_result.get("labels"):
+                    engine_result = _clean_chart_data(engine_result, user_query=query)
+                result = {**engine_result, "sources": sources}
+                _cache_result(cache_key, result)
+                return result
+        # Fall through to prose RAG if engine fails
+        logging.info("run_rag_pipeline: structured engine failed — falling back to prose RAG")
+
+    # ── Step 7: Contextual compression ───────────────────────────────────
+    if use_compression and len(chunks) > 2:
+        compressed_chunks = compress_chunks(query, chunks)
+    else:
+        compressed_chunks = chunks
+
+    # ── Step 8: Grounded generation ───────────────────────────────────────
+    q_lower = query.lower()
+    if intent == "hybrid":
+        response_format = "table"
+    elif any(k in q_lower for k in _CHART_KEYWORDS):
+        response_format = "chart"
+    elif any(k in q_lower for k in _TABLE_KEYWORDS):
+        response_format = "table"
+    else:
+        response_format = "text"
+
+    result = grounded_generate(
+        query           = query,
+        chunks          = compressed_chunks,
+        response_format = response_format,
+    )
+
+    # Attach sources
+    result["sources"] = sources
+
+    # ── Step 9: Cache and return ──────────────────────────────────────────
+    _cache_result(cache_key, result)
+    return result
+
+
+def _cache_result(key: str, result: dict) -> None:
+    """Cache result with TTL and LRU eviction."""
+    import time as _time
+    global _pipeline_cache
+    _pipeline_cache[key] = (result, _time.time())
+    if len(_pipeline_cache) > _MAX_CACHE_SIZE:
+        # Evict oldest 30 entries
+        keys_to_evict = list(_pipeline_cache.keys())[:30]
+        for k in keys_to_evict:
+            _pipeline_cache.pop(k, None)

@@ -1,0 +1,37 @@
+<policies>
+  <inbound>
+    <base />
+    <cors allow-credentials="true">
+      <allowed-origins>
+        <origin>https://agreeable-glacier-0b749ee0f.7.azurestaticapps.net</origin>
+        <origin>http://localhost:5173</origin>
+        <origin>http://localhost:3000</origin>
+      </allowed-origins>
+      <allowed-methods preflight-result-max-age="300">
+        <method>GET</method>
+        <method>POST</method>
+        <method>PUT</method>
+        <method>DELETE</method>
+        <method>OPTIONS</method>
+        <method>PATCH</method>
+      </allowed-methods>
+      <allowed-headers>
+        <header>Content-Type</header>
+        <header>Authorization</header>
+        <header>Accept</header>
+        <header>Origin</header>
+        <header>X-Requested-With</header>
+        <header>Ocp-Apim-Subscription-Key</header>
+      </allowed-headers>
+    </cors>
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <base />
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

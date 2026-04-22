@@ -1,0 +1,51 @@
+name: Agentic Bot — Property Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+jobs:
+  property-tests:
+    name: Run Property-Based Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: azure_upload_function/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+        working-directory: azure_upload_function
+
+      - name: Run property-based tests
+        run: |
+          python -m pytest tests/test_agentic_bot_properties.py \
+            -v --tb=short --junit-xml=test-results.xml
+        working-directory: azure_upload_function
+        env:
+          PYTHONPATH: .
+          AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=https;AccountName=fake;AccountKey=ZmFrZWtleQ==;EndpointSuffix=core.windows.net"
+          AZURE_OPENAI_API_KEY: fake-openai-key
+          AZURE_OPENAI_ENDPOINT: "https://fake.openai.azure.com/"
+          AZURE_SEARCH_ENDPOINT: "https://fake.search.windows.net"
+          AZURE_SEARCH_KEY: fake-search-key
+          DOC_INTELLIGENCE_ENDPOINT: "https://fake.cognitiveservices.azure.com/"
+          DOC_INTELLIGENCE_KEY: fake-doc-key
+          ENABLE_LLM_INTENT_FALLBACK: "false"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: azure_upload_function/test-results.xml
