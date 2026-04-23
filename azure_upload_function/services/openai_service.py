@@ -33,9 +33,7 @@ def _get_client() -> AzureOpenAI:
     return _client
 
 def _deployment() -> str:
-    name = get_env("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4.1-mini")
-    logging.info("Using chat deployment: %s", name)
-    return name
+    return get_env("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4.1-mini")
 
 _EMBED_MODEL = get_env("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-small")
 
