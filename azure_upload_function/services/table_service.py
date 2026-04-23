@@ -557,3 +557,51 @@ def get_chunk_embeddings(chunk_ids: list[str]) -> dict[str, list[float]]:
     except Exception:
         logging.exception("get_chunk_embeddings failed.")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Users table — for custom auth (register/login)
+# ---------------------------------------------------------------------------
+
+USERS_TABLE = "users"
+_users_client: TableClient | None = None
+
+def _get_users_client() -> TableClient:
+    global _users_client
+    if _users_client is None:
+        conn_str = require_env("AZURE_STORAGE_CONNECTION_STRING")
+        svc = TableServiceClient.from_connection_string(conn_str)
+        try:
+            svc.create_table_if_not_exists(USERS_TABLE)
+        except Exception:
+            pass
+        _users_client = svc.get_table_client(USERS_TABLE)
+    return _users_client
+
+def create_user(email: str, password_hash: str, first_name: str = "", last_name: str = "") -> bool:
+    """Returns False if user already exists."""
+    client = _get_users_client()
+    try:
+        client.get_entity(partition_key="users", row_key=email)
+        return False  # already exists
+    except Exception:
+        pass
+    client.create_entity({
+        "PartitionKey": "users",
+        "RowKey":       email,
+        "email":        email,
+        "password":     password_hash,
+        "first_name":   first_name,
+        "last_name":    last_name,
+        "created_at":   datetime.now(timezone.utc).isoformat(),
+    })
+    return True
+
+def get_user(email: str) -> dict | None:
+    client = _get_users_client()
+    try:
+        e = client.get_entity(partition_key="users", row_key=email)
+        return {"email": e["email"], "password": e["password"],
+                "first_name": e.get("first_name", ""), "last_name": e.get("last_name", "")}
+    except Exception:
+        return None

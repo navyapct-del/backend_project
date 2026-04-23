@@ -602,6 +602,72 @@ def backfill_uploaded_by_endpoint(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500, mimetype="application/json")
 
 
+# ---------------------------------------------------------------------------
+# POST /register
+# ---------------------------------------------------------------------------
+
+@app.route(route="register", methods=["POST"])
+def register(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        body       = req.get_json()
+        email      = (body.get("email") or "").strip().lower()
+        password   = body.get("password") or ""
+        first_name = body.get("first_name", "")
+        last_name  = body.get("last_name", "")
+        if not email or not password:
+            return func.HttpResponse(json.dumps({"error": "email and password required"}),
+                                     status_code=400, mimetype="application/json")
+        import bcrypt
+        from services.table_service import create_user
+        pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        created = create_user(email, pw_hash, first_name, last_name)
+        if not created:
+            return func.HttpResponse(json.dumps({"error": "User already exists"}),
+                                     status_code=409, mimetype="application/json")
+        return func.HttpResponse(json.dumps({"message": "User created"}),
+                                 status_code=201, mimetype="application/json")
+    except Exception:
+        logging.exception("/register error")
+        return func.HttpResponse(json.dumps({"error": "Registration failed"}),
+                                 status_code=500, mimetype="application/json")
+
+
+# ---------------------------------------------------------------------------
+# POST /login
+# ---------------------------------------------------------------------------
+
+@app.route(route="login", methods=["POST"])
+def login(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        body     = req.get_json()
+        email    = (body.get("email") or "").strip().lower()
+        password = body.get("password") or ""
+        if not email or not password:
+            return func.HttpResponse(json.dumps({"error": "email and password required"}),
+                                     status_code=400, mimetype="application/json")
+        import bcrypt, jwt as pyjwt
+        from services.table_service import get_user
+        user = get_user(email)
+        if not user or not bcrypt.checkpw(password.encode(), user["password"].encode()):
+            return func.HttpResponse(json.dumps({"error": "Invalid credentials"}),
+                                     status_code=401, mimetype="application/json")
+        import datetime as dt
+        secret = require_env("JWT_SECRET")
+        token = pyjwt.encode({
+            "email":      email,
+            "name":       f"{user['first_name']} {user['last_name']}".strip(),
+            "first_name": user["first_name"],
+            "last_name":  user["last_name"],
+            "exp":        dt.datetime.utcnow() + dt.timedelta(hours=8),
+        }, secret, algorithm="HS256")
+        return func.HttpResponse(json.dumps({"access_token": token}),
+                                 status_code=200, mimetype="application/json")
+    except Exception:
+        logging.exception("/login error")
+        return func.HttpResponse(json.dumps({"error": "Login failed"}),
+                                 status_code=500, mimetype="application/json")
+
+
 # GET /documents — list from Table Storage (lightweight, for UI polling)
 # ---------------------------------------------------------------------------
 
