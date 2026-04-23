@@ -784,13 +784,11 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
         )
 
         resp_type    = result.get("type", "text")
-        sources      = result.get("sources", [])
         chart_config = result.get("chart_config")
         rows         = result.get("rows", [])
         columns      = result.get("columns", [])
 
-        logging.info("query: type=%s sources=%d elapsed=%.3fs",
-                     resp_type, len(sources), time.time() - t0)
+        logging.info("query: type=%s elapsed=%.3fs", resp_type, time.time() - t0)
 
         # ── Chart response ────────────────────────────────────────────────
         if resp_type == "chart":
@@ -810,7 +808,6 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
                         "chart_config": chart_config,
                         "script":       result.get("script", ""),
                         "query":        user_query,
-                        "sources":      sources,
                     }),
                     status_code=200, mimetype="application/json")
 
@@ -828,7 +825,6 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
                         "values":     values,
                         "answer":     result.get("answer", ""),
                         "query":      user_query,
-                        "sources":    sources,
                     }),
                     status_code=200, mimetype="application/json")
 
@@ -841,7 +837,6 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
                         "series":     series,
                         "answer":     result.get("answer", ""),
                         "query":      user_query,
-                        "sources":    sources,
                     }),
                     status_code=200, mimetype="application/json")
 
@@ -855,18 +850,16 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
                     "rows":    rows,
                     "script":  result.get("script", ""),
                     "query":   user_query,
-                    "sources": sources,
                 }),
                 status_code=200, mimetype="application/json")
 
         # ── Text response (default) ───────────────────────────────────────
-        answer = result.get("answer") or "No relevant data found in documents."
+        answer = result.get("answer") or "No relevant information found in this document."
         return func.HttpResponse(
             json.dumps({
-                "type":    "text",
-                "answer":  answer,
-                "query":   user_query,
-                "sources": sources,
+                "type":   "text",
+                "answer": answer,
+                "query":  user_query,
             }),
             status_code=200, mimetype="application/json")
 

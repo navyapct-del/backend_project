@@ -313,18 +313,16 @@ JSON:"""
 _SYSTEM_PROMPT = """You are a helpful, precise AI assistant for document question-answering.
 
 CORE RULES:
-1. Answer from the provided context. Prefer context over prior knowledge.
-2. If the context clearly does not contain the answer, say: "The documents do not contain enough information to answer this question."
-3. Be specific and factual. Mention the source document name when useful.
-4. For numerical data, include the exact figures from the context.
-5. Do not fabricate data, names, or statistics not present in the context.
+1. Answer ONLY using the provided document context. Do not use external knowledge.
+2. If the context does not contain the answer, say: "No relevant information found in this document."
+3. Be specific and factual. Include exact figures, names, and dates from the context.
+4. Do not fabricate data, names, or statistics not present in the context.
 
 RESPONSE QUALITY:
 - Be comprehensive but concise
 - Use numbered lists for multi-part answers
 - Use bullet points for enumerations
-- Bold key terms or figures using **term** syntax
-- Always end with: Sources: [filename1, filename2, ...]"""
+- Bold key terms or figures using **term** syntax"""
 
 
 def grounded_generate(
@@ -349,16 +347,14 @@ def grounded_generate(
           "labels":  [...],   # for chart
           "values":  [...],   # for chart
           "chart_type": str,  # for chart
-          "sources": [...]
         }
     """
     from services.openai_service import _get_client, _deployment
 
     if not chunks:
         return {
-            "type":    "text",
-            "answer":  "No relevant documents found. Please upload documents first.",
-            "sources": [],
+            "type":   "text",
+            "answer": "No relevant information found in this document.",
         }
 
     # Build context with clear source attribution
@@ -393,9 +389,8 @@ def grounded_generate(
 
     if not context_parts:
         return {
-            "type":    "text",
-            "answer":  "No content could be extracted from the retrieved documents.",
-            "sources": citation_list,
+            "type":   "text",
+            "answer": "No relevant information found in this document.",
         }
 
     context = "\n\n---\n\n".join(context_parts)
@@ -442,16 +437,15 @@ Question: {query}
         if parsed.get("type") == "chart":
             parsed = _clean_chart_data(parsed, user_query=query)
 
-        logging.info("grounded_generate: type=%s answer_len=%d sources=%d",
-                     parsed.get("type"), len(str(parsed.get("answer", ""))), len(citation_list))
+        logging.info("grounded_generate: type=%s answer_len=%d",
+                     parsed.get("type"), len(str(parsed.get("answer", ""))))
         return parsed
 
     except Exception as exc:
         logging.error("grounded_generate failed: %s", exc)
         return {
-            "type":    "text",
-            "answer":  "Failed to generate answer. Please try again.",
-            "sources": citation_list,
+            "type":   "text",
+            "answer": "Failed to generate answer. Please try again.",
         }
 
 
@@ -510,11 +504,10 @@ def _build_format_instructions(
     citation_list: list[str],
 ) -> str:
     """Build format-specific instructions for the LLM."""
-    sources_json = json.dumps(citation_list)
 
     if response_format == "table":
-        return f"""Respond with ONLY a valid JSON object in this exact format:
-{{"type":"table","columns":["Col1","Col2","Col3"],"rows":[{{"Col1":"v1","Col2":"v2","Col3":"v3"}}],"answer":"1-line summary of the table","sources":{sources_json}}}
+        return """Respond with ONLY a valid JSON object in this exact format:
+{"type":"table","columns":["Col1","Col2","Col3"],"rows":[{"Col1":"v1","Col2":"v2","Col3":"v3"}],"answer":"1-line summary of the table"}
 
 Rules:
 - Extract ALL relevant data from the context into table rows
@@ -523,8 +516,8 @@ Rules:
 - "answer" should be a 1-line summary of what the table shows"""
 
     if response_format == "chart":
-        return f"""Respond with ONLY a valid JSON object in this exact format:
-{{"type":"chart","chart_type":"bar|line|pie|area|scatter","labels":["A","B","C"],"values":[10,20,30],"answer":"1-line summary","sources":{sources_json}}}
+        return """Respond with ONLY a valid JSON object in this exact format:
+{"type":"chart","chart_type":"bar|line|pie|area|scatter","labels":["A","B","C"],"values":[10,20,30],"answer":"1-line summary"}
 
 Rules:
 - Extract numeric data from the context
@@ -532,18 +525,18 @@ Rules:
 - Otherwise choose chart_type based on data: line for trends/time, pie for proportions/shares, bar for comparisons
 - labels = category names or time periods
 - values = corresponding numeric values
-- If multiple series exist, use: {{"type":"chart","chart_type":"bar","series":{{"Series1":[1,2,3],"Series2":[4,5,6]}},"labels":["A","B","C"],"answer":"...","sources":{sources_json}}}"""
+- If multiple series exist, use: {"type":"chart","chart_type":"bar","series":{"Series1":[1,2,3],"Series2":[4,5,6]},"labels":["A","B","C"],"answer":"..."}"""
 
     # Default: text
-    return f"""Respond with ONLY a valid JSON object in this exact format:
-{{"type":"text","answer":"<your detailed answer here>","sources":{sources_json}}}
+    return """Respond with ONLY a valid JSON object in this exact format:
+{"type":"text","answer":"<your detailed answer here>"}
 
 Rules:
 - Answer must be comprehensive and directly address the question
 - Use numbered lists (1. 2. 3.) for multi-part answers
 - Use **bold** for key terms and figures
 - Include exact numbers/dates/names from the context
-- End the answer with: \\n\\nSources: {', '.join(citation_list)}"""
+- If the answer is not found in the context, say: "No relevant information found in this document." """
 
 
 def _parse_llm_response(
@@ -563,8 +556,8 @@ def _parse_llm_response(
     try:
         parsed = json.loads(cleaned)
         if isinstance(parsed, dict) and "type" in parsed:
-            if "sources" not in parsed:
-                parsed["sources"] = citation_list
+            # Remove sources field if present (we don't expose it)
+            parsed.pop("sources", None)
             return parsed
     except Exception:
         pass
@@ -575,22 +568,19 @@ def _parse_llm_response(
         try:
             parsed = json.loads(m.group())
             if isinstance(parsed, dict) and "type" in parsed:
-                if "sources" not in parsed:
-                    parsed["sources"] = citation_list
+                parsed.pop("sources", None)
                 return parsed
         except Exception:
             pass
 
     # Plain text fallback — wrap in text envelope
-    # Strip any leading/trailing JSON artifacts before using as answer
     answer_text = raw.strip().lstrip("{[").rstrip("}]").strip()
     if not answer_text:
         answer_text = raw
     logging.warning("_parse_llm_response: LLM returned plain text, wrapping as text response (len=%d)", len(answer_text))
     return {
-        "type":    "text",
-        "answer":  answer_text,
-        "sources": citation_list,
+        "type":   "text",
+        "answer": answer_text,
     }
 
 
@@ -629,7 +619,7 @@ def run_rag_pipeline(
     from services.table_service import TableService
 
     if not query or not query.strip():
-        return {"type": "text", "answer": "No question provided.", "sources": []}
+        return {"type": "text", "answer": "No question provided."}
 
     # ── Step 1: Multi-query retrieval with HyDE ───────────────────────────
     chunks = multi_query_retrieve(
@@ -642,9 +632,8 @@ def run_rag_pipeline(
 
     if not chunks:
         return {
-            "type":    "text",
-            "answer":  "No relevant documents found for your query. Please ensure documents have been uploaded.",
-            "sources": [],
+            "type":   "text",
+            "answer": "No relevant information found in this document.",
         }
 
     # ── Step 2: Check cache ───────────────────────────────────────────────
@@ -659,21 +648,7 @@ def run_rag_pipeline(
         else:
             del _pipeline_cache[cache_key]  # expired
 
-    # ── Step 3: Build sources list ────────────────────────────────────────
-    seen_files = set()
-    sources    = []
-    for chunk in chunks:
-        fname = chunk.get("filename", "")
-        if fname and fname not in seen_files:
-            seen_files.add(fname)
-            sources.append({
-                "filename": fname,
-                "summary":  chunk.get("summary", ""),
-                "blob_url": chunk.get("blob_url", ""),
-                "score":    chunk.get("score", 0),
-            })
-
-    # ── Step 4: Check for structured data (for analytical queries) ────────
+    # ── Step 3: Check for structured data (for analytical queries) ────────
     # CRITICAL: match structured data to the query topic, not just "first with data"
     table_svc = TableService()
     stored_sd = None
@@ -794,7 +769,7 @@ def run_rag_pipeline(
                 # Clean chart data if applicable (Shape A: labels/values)
                 if engine_result.get("type") == "chart" and engine_result.get("labels"):
                     engine_result = _clean_chart_data(engine_result, user_query=query)
-                result = {**engine_result, "sources": sources}
+                result = {k: v for k, v in engine_result.items() if k != "sources"}
                 _cache_result(cache_key, result)
                 return result
         # Fall through to prose RAG if engine fails
@@ -822,9 +797,6 @@ def run_rag_pipeline(
         chunks          = compressed_chunks,
         response_format = response_format,
     )
-
-    # Attach sources
-    result["sources"] = sources
 
     # ── Step 9: Cache and return ──────────────────────────────────────────
     _cache_result(cache_key, result)
