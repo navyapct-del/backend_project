@@ -240,19 +240,7 @@ def vector_search(
         search_kwargs["filter"] = f"filename eq '{filename_filter}'"
     elif uploaded_by:
         safe = uploaded_by.replace("'", "''")
-        # Check if any chunks exist for this user before applying filter
-        # (avoids empty results when backfill hasn't run yet)
-        try:
-            probe = list(client.search(
-                search_text="*",
-                filter=f"uploaded_by eq '{safe}'",
-                select=["id"],
-                top=1,
-            ))
-            if probe:
-                search_kwargs["filter"] = f"uploaded_by eq '{safe}'"
-        except Exception:
-            pass
+        search_kwargs["filter"] = f"uploaded_by eq '{safe}'"
 
     try:
         results = list(_get_search_client().search(**search_kwargs))
