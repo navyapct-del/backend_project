@@ -617,7 +617,13 @@ def register(req: func.HttpRequest) -> func.HttpResponse:
         if not email or not password:
             return func.HttpResponse(json.dumps({"error": "email and password required"}),
                                      status_code=400, mimetype="application/json")
-        import bcrypt
+        import re, bcrypt
+        if (len(password) < 8 or not re.search(r'[A-Z]', password) or
+            not re.search(r'[a-z]', password) or not re.search(r'[0-9]', password) or
+            not re.search(r'[!@#$%^&*(),.?":{}|<>]', password)):
+            return func.HttpResponse(
+                json.dumps({"error": "Password must be 8+ chars with uppercase, lowercase, number and special character"}),
+                status_code=400, mimetype="application/json")
         from services.table_service import create_user
         pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
         created = create_user(email, pw_hash, first_name, last_name)
