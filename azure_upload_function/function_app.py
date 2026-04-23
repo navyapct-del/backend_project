@@ -744,11 +744,13 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
 
     user_query      = req.params.get("q", "")
     filename_filter = req.params.get("filename", "")
+    doc_id          = ""
     if not user_query:
         try:
             body            = req.get_json()
             user_query      = body.get("q", "")
             filename_filter = body.get("filename", filename_filter)
+            doc_id          = body.get("documentId", "").strip()
         except Exception:
             pass
 
@@ -770,27 +772,86 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
         except Exception:
             pass
 
+    # ── Auto single→multi fallback threshold ─────────────────────────────
+    # A single-doc probe is considered "good enough" when at least one chunk
+    # scores above this threshold.  Below it we fall back to all documents.
+    _SINGLE_DOC_THRESHOLD = 0.45
+
     try:
         t0 = time.time()
 
-        from services.rag_pipeline import run_rag_pipeline
-        result = run_rag_pipeline(
-            query           = user_query,
-            filename_filter = filename_filter,
-            uploaded_by     = uploaded_by,
-            top_k           = 7,
-            use_hyde        = True,
-            use_compression = True,
-        )
+        from services.rag_pipeline import run_rag_pipeline, grounded_generate
+        from services.openai_service import generate_embedding
+        from services.search_service import vector_search as _vsearch
+
+        retrieval_mode = "single" if doc_id else "multi"
+        chunks = []
+
+        # ── Step 1: probe single document if doc_id provided ─────────────
+        if doc_id:
+            probe_emb = generate_embedding(user_query)
+            if probe_emb:
+                chunks = _vsearch(
+                    query_embedding = probe_emb,
+                    query_text      = user_query,
+                    top             = 5,
+                    doc_id_filter   = doc_id,
+                )
+            # ── Step 2: fallback if no good chunks in single doc ──────────
+            best_score = max((c["score"] for c in chunks), default=0)
+            if not chunks or best_score < _SINGLE_DOC_THRESHOLD:
+                logging.info(
+                    "query: single-doc probe score=%.3f < threshold=%.2f → fallback to multi",
+                    best_score, _SINGLE_DOC_THRESHOLD,
+                )
+                chunks = []          # let run_rag_pipeline do full multi-doc search
+                retrieval_mode = "multi"
+
+        # ── Step 3: full pipeline (multi-doc or no doc_id given) ──────────
+        if not chunks:
+            result = run_rag_pipeline(
+                query           = user_query,
+                filename_filter = filename_filter,
+                uploaded_by     = uploaded_by,
+                top_k           = 7,
+                use_hyde        = True,
+                use_compression = True,
+            )
+        else:
+            # Good single-doc chunks — generate answer directly
+            result = grounded_generate(query=user_query, chunks=chunks)
+
+        # ── Step 4: final validation — no relevant content anywhere ───────
+        answer = result.get("answer", "")
+        if not answer or not result.get("sources") and retrieval_mode == "multi":
+            result.setdefault("answer",
+                "No relevant information found in the uploaded documents.")
+
+        # Attach retrieval mode to result for response envelope
+        result["_mode"] = retrieval_mode
+
+        # Normalise sources to {documentId, fileName} shape
+        raw_sources = result.get("sources", [])
+        norm_sources = []
+        for s in raw_sources:
+            if isinstance(s, dict):
+                norm_sources.append({
+                    "documentId": s.get("doc_id") or s.get("documentId") or "",
+                    "fileName":   s.get("filename") or s.get("fileName") or "",
+                })
+            elif isinstance(s, str):
+                norm_sources.append({"documentId": "", "fileName": s})
+        result["sources"] = norm_sources
 
         resp_type    = result.get("type", "text")
         sources      = result.get("sources", [])
         chart_config = result.get("chart_config")
         rows         = result.get("rows", [])
         columns      = result.get("columns", [])
+        mode         = result.get("_mode", retrieval_mode)
 
-        logging.info("query: type=%s sources=%d elapsed=%.3fs",
-                     resp_type, len(sources), time.time() - t0)
+        logging.info("query: type=%s mode=%s sources=%d elapsed=%.3fs",
+                     resp_type, mode, len(sources), time.time() - t0)
 
         # ── Chart response ────────────────────────────────────────────────
         if resp_type == "chart":
@@ -811,6 +872,7 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
                         "script":       result.get("script", ""),
                         "query":        user_query,
                         "sources":      sources,
+                        "mode":         mode,
                     }),
                     status_code=200, mimetype="application/json")
 
@@ -829,6 +891,7 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
                         "answer":     result.get("answer", ""),
                         "query":      user_query,
                         "sources":    sources,
+                        "mode":       mode,
                     }),
                     status_code=200, mimetype="application/json")
 
@@ -842,6 +905,7 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
                         "answer":     result.get("answer", ""),
                         "query":      user_query,
                         "sources":    sources,
+                        "mode":       mode,
                     }),
                     status_code=200, mimetype="application/json")
 
@@ -856,6 +920,7 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
                     "script":  result.get("script", ""),
                     "query":   user_query,
                     "sources": sources,
+                    "mode":    mode,
                 }),
                 status_code=200, mimetype="application/json")
 
@@ -867,6 +932,7 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
                 "answer":  answer,
                 "query":   user_query,
                 "sources": sources,
+                "mode":    mode,
             }),
             status_code=200, mimetype="application/json")
 

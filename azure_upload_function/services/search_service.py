@@ -203,6 +203,7 @@ def vector_search(
     top:             int = _TOP_K,
     filename_filter: str = "",
     uploaded_by:     str = "",
+    doc_id_filter:   str = "",
     min_score:       float = MIN_SCORE,
 ) -> list[dict]:
     """
@@ -236,7 +237,10 @@ def vector_search(
     except Exception:
         pass
 
-    if filename_filter:
+    if doc_id_filter:
+        safe_doc = doc_id_filter.replace("'", "''")
+        search_kwargs["filter"] = f"doc_id eq '{safe_doc}'"
+    elif filename_filter:
         search_kwargs["filter"] = f"filename eq '{filename_filter}'"
     elif uploaded_by:
         safe = uploaded_by.replace("'", "''")
