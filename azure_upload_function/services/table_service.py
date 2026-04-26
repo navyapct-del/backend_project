@@ -12,7 +12,7 @@ PARTITION_KEY = "documents"
 
 # Increment this when the structured_data schema changes.
 # Any stored record with a lower version will be auto-reprocessed.
-SCHEMA_VERSION = 4   # v4 = removed drop_duplicates (preserves all real data rows)
+SCHEMA_VERSION = 5   # v5 = NaN-safe dedup in structured_to_df
 
 _table_client: TableClient | None = None
 
