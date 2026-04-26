@@ -942,7 +942,7 @@ def download_document(req: func.HttpRequest) -> func.HttpResponse:
                 status_code=404, mimetype="application/json")
 
         # Generate SAS URL (valid for 1 hour)
-        sas_url = BlobService().generate_sas_url(blob_url, expiry_hours=1)
+        sas_url = BlobService().generate_sas_url(blob_url, expiry_hours=8)
 
         return func.HttpResponse(
             json.dumps({"sas_url": sas_url, "filename": filename}),
