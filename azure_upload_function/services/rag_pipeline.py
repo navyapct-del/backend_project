@@ -786,18 +786,23 @@ def run_rag_pipeline(
         def _run_engine_fallback(q: str, sd: dict) -> dict | None:
             """
             Fallback: auto-detect the best categorical column and run COUNT(*) GROUP BY.
-            Used when the LLM plan fails to map query words to actual column names.
+            Filters out blank/null category values before grouping.
             """
             try:
+                import pandas as _pd
                 df = structured_to_df(sd)
                 if df.empty:
                     return None
                 df = df.drop(columns=[c for c in df.columns if c.startswith("_")], errors="ignore")
-                # Pick the categorical column with lowest cardinality (best for groupby/pie)
                 cat_cols = df.select_dtypes(include="object").columns.tolist()
                 if not cat_cols:
                     return None
-                best_col = min(cat_cols, key=lambda c: df[c].nunique())
+                # Pick lowest non-zero cardinality (excludes Name/ID columns with unique values)
+                def _nunique_clean(col):
+                    return df[col].replace("", _pd.NA).dropna().nunique() or 9999
+                best_col = min(cat_cols, key=_nunique_clean)
+                # Filter blank/null values in the groupby column before counting
+                df = df[df[best_col].notna() & (df[best_col].astype(str).str.strip() != "")]
                 plan = {
                     "operation":    "groupby",
                     "group_by":     [best_col],
