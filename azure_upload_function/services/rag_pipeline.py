@@ -638,7 +638,7 @@ def run_rag_pipeline(
 
     # ── Step 2: Check cache ───────────────────────────────────────────────
     import time as _time
-    cache_key = hashlib.md5((query + "|" + filename_filter).encode()).hexdigest()
+    cache_key = hashlib.md5((query + "|" + filename_filter + "|" + uploaded_by).encode()).hexdigest()
     cached = _pipeline_cache.get(cache_key)
     if cached:
         result, ts = cached
@@ -706,21 +706,28 @@ def run_rag_pipeline(
             score += 1
         return score
 
-    # Score all retrieved documents' structured data and pick the best match
-    best_score = -1
-    for chunk in chunks:
-        fname = chunk.get("filename", "")
-        if not fname:
-            continue
-        sd = table_svc.get_structured_data(fname, uploaded_by=uploaded_by)
-        if not sd:
-            continue
-        score = _sd_relevance_score(sd, fname)
-        logging.info("run_rag_pipeline: structured data relevance '%s' score=%d", fname, score)
-        if score > best_score:
-            best_score = score
-            stored_sd  = sd
-            logging.info("run_rag_pipeline: selected structured data from '%s' (score=%d)", fname, score)
+    # When a specific file is requested, use its structured data directly (no scoring needed)
+    if filename_filter:
+        stored_sd = table_svc.get_structured_data(filename_filter, uploaded_by=uploaded_by)
+        if stored_sd:
+            logging.info("run_rag_pipeline: using structured data directly from filename_filter='%s'", filename_filter)
+        best_score = 1 if stored_sd else -1
+    else:
+        # Score all retrieved documents' structured data and pick the best match
+        best_score = -1
+        for chunk in chunks:
+            fname = chunk.get("filename", "")
+            if not fname:
+                continue
+            sd = table_svc.get_structured_data(fname, uploaded_by=uploaded_by)
+            if not sd:
+                continue
+            score = _sd_relevance_score(sd, fname)
+            logging.info("run_rag_pipeline: structured data relevance '%s' score=%d", fname, score)
+            if score > best_score:
+                best_score = score
+                stored_sd  = sd
+                logging.info("run_rag_pipeline: selected structured data from '%s' (score=%d)", fname, score)
 
     # Only use structured data if it has meaningful relevance to the query
     if best_score <= 0:
