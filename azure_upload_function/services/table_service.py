@@ -12,7 +12,7 @@ PARTITION_KEY = "documents"
 
 # Increment this when the structured_data schema changes.
 # Any stored record with a lower version will be auto-reprocessed.
-SCHEMA_VERSION = 6   # v6 = single-sheet no-dedup fix
+SCHEMA_VERSION = 7   # v7 = fix blob_svc undefined in reprocess
 
 _table_client: TableClient | None = None
 

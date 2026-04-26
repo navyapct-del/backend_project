@@ -550,7 +550,8 @@ def reprocess(req: func.HttpRequest) -> func.HttpResponse:
                 sd_url = ""
                 if structured_data:
                     try:
-                        sd_url = blob_svc.upload_structured_data(doc["RowKey"], structured_data)
+                        from services.blob_service import BlobService as _BlobSvc
+                        sd_url = _BlobSvc().upload_structured_data(doc["RowKey"], structured_data)
                     except Exception as blob_exc:
                         logging.warning("Reprocess: blob upload failed for %s: %s", filename, blob_exc)
 
