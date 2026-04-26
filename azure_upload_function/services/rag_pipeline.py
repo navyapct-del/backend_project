@@ -712,7 +712,7 @@ def run_rag_pipeline(
         fname = chunk.get("filename", "")
         if not fname:
             continue
-        sd = table_svc.get_structured_data(fname)
+        sd = table_svc.get_structured_data(fname, uploaded_by=uploaded_by)
         if not sd:
             continue
         score = _sd_relevance_score(sd, fname)

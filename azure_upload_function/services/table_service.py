@@ -148,15 +148,23 @@ class TableService:
             logging.exception("Table update failed for filename=%s", filename)
             raise
 
-    def get_structured_data(self, filename: str) -> dict | None:
+    def get_structured_data(self, filename: str, uploaded_by: str = "") -> dict | None:
         """
         Retrieve structured data — downloads from Blob Storage if URL exists,
         falls back to inline field. Returns None if stale or missing.
         """
         try:
-            entities = list(self._client.query_entities(
-                query_filter=f"PartitionKey eq '{PARTITION_KEY}' and filename eq '{filename}'"
-            ))
+            safe_fname = filename.replace("'", "''")
+            if uploaded_by:
+                safe_owner = uploaded_by.replace("'", "''")
+                query_filter = (
+                    f"PartitionKey eq '{PARTITION_KEY}' and filename eq '{safe_fname}'"
+                    f" and uploaded_by eq '{safe_owner}'"
+                )
+            else:
+                query_filter = f"PartitionKey eq '{PARTITION_KEY}' and filename eq '{safe_fname}'"
+
+            entities = list(self._client.query_entities(query_filter=query_filter))
             if not entities:
                 return None
 
