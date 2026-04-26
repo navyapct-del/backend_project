@@ -247,7 +247,8 @@ AGGREGATION INTENT DETECTION:
 - "total", "sum of", "sum" → SUM(column)
 - "average", "avg", "mean" → type:"avg" aggregation on the relevant column
 - "chart", "graph", "plot" + category column → groupby + COUNT(*) + chart
-- NEVER use operator "=" with value null — always use "isnull" or "notnull"
+- For "distribution by category" or "breakdown by X": group_by MUST use a LOW-CARDINALITY column (one that represents a category/type/status/department, NOT a name/ID/date). If unsure, pick the column whose name contains words like "category", "type", "status", "department", "group", "class", "level".
+- NEVER use integer literals (e.g. 1, 2) in "select" or "group_by" — always use actual column names from the dataset
 - Choose chart type using CHART TYPE SELECTION RULES above — do NOT default to bar for everything
 
 CATEGORICAL COMPARISON (A vs B, split by category):
@@ -596,10 +597,38 @@ def execute_plan(df: pd.DataFrame, plan: dict) -> dict:
         operation = plan.get("operation", "select")
 
         if group_cols and aggs:
+            # Cardinality guard: reject groupby on high-cardinality columns (e.g. names, IDs)
+            for gc in group_cols:
+                n_unique = result_df[gc].nunique()
+                n_rows   = len(result_df)
+                if n_unique > 30 and n_unique > n_rows * 0.5:
+                    logging.warning(
+                        "execute_plan: groupby column '%s' has %d unique values (%d rows) — likely wrong column, rejecting plan",
+                        gc, n_unique, n_rows
+                    )
+                    return {
+                        "type":    "error",
+                        "answer":  f"Column '{gc}' has too many unique values ({n_unique}) to group by meaningfully. Please specify a categorical column.",
+                        "columns": [], "rows": [], "chart_config": None, "script": "",
+                    }
             result_df = _apply_groupby(result_df, group_cols, aggs)
             resp_type = "table"
 
         elif group_cols and not aggs:
+            # groupby with no explicit aggregation → count rows per group
+            for gc in group_cols:
+                n_unique = result_df[gc].nunique()
+                n_rows   = len(result_df)
+                if n_unique > 30 and n_unique > n_rows * 0.5:
+                    logging.warning(
+                        "execute_plan: groupby column '%s' has %d unique values — likely wrong column, rejecting plan",
+                        gc, n_unique
+                    )
+                    return {
+                        "type":    "error",
+                        "answer":  f"Column '{gc}' has too many unique values ({n_unique}) to group by meaningfully. Please specify a categorical column.",
+                        "columns": [], "rows": [], "chart_config": None, "script": "",
+                    }
             # groupby with no explicit aggregation → count rows per group
             result_df = (
                 result_df.groupby(group_cols, as_index=False)
