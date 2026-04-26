@@ -731,14 +731,18 @@ def run_rag_pipeline(
                 chunk_score_map[fname] = max(chunk_score_map.get(fname, 0.0), chunk.get("score", 0.0))
 
         # Also scan all user's documents for chart/agg queries
-        if uploaded_by and is_chart_or_agg:
+        if is_chart_or_agg:
             try:
-                all_docs = table_svc.list_documents_by_user(uploaded_by)
+                if uploaded_by:
+                    all_docs = table_svc.list_documents_by_user(uploaded_by)
+                else:
+                    # No user identity — scan all documents (single-tenant / dev mode)
+                    all_docs = table_svc.list_documents()
                 for doc in all_docs:
                     if doc.get("filename"):
                         candidate_filenames.add(doc["filename"])
             except Exception as exc:
-                logging.warning("run_rag_pipeline: list_documents_by_user failed: %s", exc)
+                logging.warning("run_rag_pipeline: list_documents failed: %s", exc)
 
         best_composite = -1.0
         for fname in candidate_filenames:
