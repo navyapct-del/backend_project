@@ -232,6 +232,7 @@ Rules:
 
 SELECT * PREVENTION (CRITICAL):
 - NEVER generate "select": [] or "select": ["*"] unless the query explicitly says "show everything" or "all columns"
+- NEVER use integer literals (e.g. 1, 2) in "select" or "group_by" — always use actual column names from the dataset
 - "list all X" → select ONLY the column that contains X values, e.g. select:["Name"], distinct:true
 - "show all X" → select ONLY the column that contains X values, NOT all columns
 - "list all names" → find the column whose name means "name" (e.g. "Name", "Student Name", "Full Name") and set select to ONLY that column
@@ -414,7 +415,10 @@ def _validate_plan(plan: dict, columns: list[str]) -> None:
 
     col_set = {c.lower() for c in columns}
 
-    def _valid(col: str) -> bool:
+    def _valid(col) -> bool:
+        # Reject non-string values (e.g. integer literals like 1)
+        if not isinstance(col, str):
+            return False
         return col == "*" or col.lower() in col_set
 
     # Capture original non-wildcard select before sanitization
