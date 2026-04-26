@@ -146,6 +146,7 @@ def index_document(
     if embedding:
         doc["embedding"] = embedding
 
+    last_exc = None
     from time import sleep
     for attempt in range(1, retries + 1):
         try:
@@ -155,11 +156,12 @@ def index_document(
                 return
             logging.warning("index_document attempt %d/%d failed", attempt, retries)
         except Exception as exc:
+            last_exc = exc
             logging.warning("index_document attempt %d/%d: %s", attempt, retries, exc)
         if attempt < retries:
             sleep(2 ** attempt)
 
-    raise RuntimeError(f"Indexing failed for {record_id} after {retries} attempts")
+    raise RuntimeError(f"Indexing failed for {record_id} after {retries} attempts: {last_exc}")
 
 
 def backfill_uploaded_by(doc_id_to_owner: dict[str, str]) -> int:
