@@ -832,7 +832,8 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
                 axis_info = detect_dual_axis_from_rows(rows, x_key)
                 chart_config["series"]   = axis_info["series"]
                 chart_config["dualAxis"] = axis_info["dual_axis"]
-                if axis_info["dual_axis"]:
+                _single_series_types = {"pie", "donut", "radar", "funnel", "treemap"}
+                if axis_info["dual_axis"] and chart_config.get("type") not in _single_series_types:
                     chart_config["type"] = axis_info.get("chart_type", "composed")
                 return func.HttpResponse(
                     _safe_json({
