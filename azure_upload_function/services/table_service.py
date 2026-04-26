@@ -177,6 +177,11 @@ class TableService:
             if not entities:
                 return None
 
+            # Pick the most recently processed entity (highest schema_version, then latest processed_at)
+            entities.sort(key=lambda x: (
+                int(x.get("schema_version", 0)),
+                x.get("processed_at", "") or ""
+            ), reverse=True)
             e  = entities[0]
             sv = int(e.get("schema_version", 0))
             if sv < SCHEMA_VERSION:
