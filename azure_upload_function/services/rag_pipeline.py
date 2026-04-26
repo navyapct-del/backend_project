@@ -469,13 +469,25 @@ def _clean_chart_data(chart: dict, user_query: str = "") -> dict:
     labels  = labels[:min_len]
     values  = values[:min_len]
 
-    # Convert values to numbers, replace None with 0
-    clean_values = []
-    for v in values:
+    # Convert values to numbers — also evaluate arithmetic expressions like "110042+71383"
+    def _to_float(v) -> float:
+        if v is None:
+            return 0.0
         try:
-            clean_values.append(float(v) if v is not None else 0.0)
+            return float(v)
         except (TypeError, ValueError):
-            clean_values.append(0.0)
+            pass
+        # Evaluate safe arithmetic expressions (only digits, spaces, +, -, *, /, .)
+        s = str(v).strip()
+        import re as _re
+        if _re.fullmatch(r"[\d\s\+\-\*\/\.]+", s):
+            try:
+                return float(eval(s))  # nosec — input validated to digits+operators only
+            except Exception:
+                pass
+        return 0.0
+
+    clean_values = [_to_float(v) for v in values]
 
     if chart_type == "pie":
         # Filter out zero/negative slices
