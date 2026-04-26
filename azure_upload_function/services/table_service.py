@@ -12,7 +12,7 @@ PARTITION_KEY = "documents"
 
 # Increment this when the structured_data schema changes.
 # Any stored record with a lower version will be auto-reprocessed.
-SCHEMA_VERSION = 7   # v7 = fix blob_svc undefined in reprocess
+SCHEMA_VERSION = 8   # v8 = reprocess now re-indexes chunks + fixes stale search index
 
 _table_client: TableClient | None = None
 

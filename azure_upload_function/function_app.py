@@ -564,6 +564,37 @@ def reprocess(req: func.HttpRequest) -> func.HttpResponse:
                     structured_data     = structured_data if not sd_url else None,
                     structured_data_url = sd_url,
                 )
+
+                # Re-index chunks in Azure AI Search (replaces old chunks for this doc)
+                try:
+                    from services.chunking_service import chunk_text
+                    from services.search_service   import index_document, ensure_index
+                    from services.table_service    import store_chunk_embedding
+                    ensure_index()
+                    chunks = chunk_text(text, doc["RowKey"], filename)
+                    if not chunks:
+                        chunks = [{"chunk_id": doc["RowKey"], "doc_id": doc["RowKey"],
+                                   "filename": filename, "chunk_index": 0, "text": text[:32000]}]
+                    for chunk in chunks:
+                        chunk_emb = generate_embedding(chunk["text"])
+                        index_document(
+                            doc_id      = doc["RowKey"],
+                            filename    = filename,
+                            content     = chunk["text"],
+                            summary     = "",
+                            tags        = [],
+                            blob_url    = blob_url,
+                            embedding   = chunk_emb,
+                            chunk_index = chunk["chunk_index"],
+                            chunk_id    = chunk["chunk_id"],
+                            uploaded_by = doc.get("uploaded_by", ""),
+                        )
+                        if chunk_emb:
+                            store_chunk_embedding(chunk["chunk_id"], doc["RowKey"], chunk_emb)
+                    logging.info("Re-indexed %d chunks for %s", len(chunks), filename)
+                except Exception as idx_exc:
+                    logging.warning("Reprocess: chunk re-index failed for %s: %s", filename, idx_exc)
+
                 logging.info("Reprocessed: %s → v%d", filename, SCHEMA_VERSION)
                 updated += 1
 
