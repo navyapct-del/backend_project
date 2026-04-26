@@ -77,6 +77,7 @@ class TableService:
     # ------------------------------------------------------------------
 
     def update_ai_fields(self, filename: str, text: str, summary: str, tags: str,
+                         record_id: str = "",
                          structured_data: dict | None = None,
                          text_url: str = "",
                          structured_data_url: str = "") -> bool:
@@ -99,11 +100,19 @@ class TableService:
                             len(text_inline))
 
         try:
-            entities = list(self._client.query_entities(
-                query_filter=f"PartitionKey eq '{PARTITION_KEY}' and filename eq '{filename}'"
-            ))
+            if record_id:
+                # Prefer direct RowKey lookup — avoids filename collision with deleted records
+                try:
+                    e = self._client.get_entity(partition_key=PARTITION_KEY, row_key=record_id)
+                    entities = [e]
+                except Exception:
+                    entities = []
+            else:
+                entities = list(self._client.query_entities(
+                    query_filter=f"PartitionKey eq '{PARTITION_KEY}' and filename eq '{filename}'"
+                ))
             if not entities:
-                logging.warning("update_ai_fields: no entity for filename=%s", filename)
+                logging.warning("update_ai_fields: no entity for filename=%s record_id=%s", filename, record_id)
                 return False
 
             e     = entities[0]

@@ -420,7 +420,8 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
 
         table_svc.update_ai_fields(
             filename, text, summary, tags_str,
-            structured_data     = structured_data if not sd_url else None,  # inline only if no URL
+            record_id           = record_id,
+            structured_data     = structured_data if not sd_url else None,
             text_url            = text_url,
             structured_data_url = sd_url,
         )
