@@ -97,29 +97,14 @@ def _clean_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 def _clean_values(df: pd.DataFrame, source_label: str = "") -> pd.DataFrame:
     """
-    1. Strip leading/trailing whitespace from all string cells
-    2. Strip column names (safety pass after _clean_columns)
-    3. Drop exact duplicate rows
-    Logs before/after counts.
+    Strip leading/trailing whitespace from all string cells.
+    Does NOT drop duplicates — duplicate rows are real records in transactional data.
     """
-    # Trim all string values — leaves numbers, dates, NaN untouched
     df = df.apply(
         lambda col: col.map(lambda x: x.strip() if isinstance(x, str) else x)
     )
-
-    # Normalise column names one more time (handles any whitespace reintroduced)
     df.columns = df.columns.str.strip()
-
-    # Drop exact duplicates
-    before = len(df)
-    df = df.drop_duplicates().reset_index(drop=True)
-    dupes = before - len(df)
-    if dupes:
-        logging.info("_clean_values [%s]: removed %d duplicate rows (%d → %d)",
-                     source_label, dupes, before, len(df))
-    else:
-        logging.info("_clean_values [%s]: no duplicates found (%d rows)", source_label, len(df))
-
+    logging.info("_clean_values [%s]: %d rows", source_label, len(df))
     return df
 
 

@@ -783,7 +783,47 @@ def run_rag_pipeline(
                 logging.warning("_run_engine failed: %s", exc)
                 return None
 
+        def _run_engine_fallback(q: str, sd: dict) -> dict | None:
+            """
+            Fallback: auto-detect the best categorical column and run COUNT(*) GROUP BY.
+            Used when the LLM plan fails to map query words to actual column names.
+            """
+            try:
+                df = structured_to_df(sd)
+                if df.empty:
+                    return None
+                df = df.drop(columns=[c for c in df.columns if c.startswith("_")], errors="ignore")
+                # Pick the categorical column with lowest cardinality (best for groupby/pie)
+                cat_cols = df.select_dtypes(include="object").columns.tolist()
+                if not cat_cols:
+                    return None
+                best_col = min(cat_cols, key=lambda c: df[c].nunique())
+                plan = {
+                    "operation":    "groupby",
+                    "group_by":     [best_col],
+                    "aggregations": [{"type": "count", "column": "*"}],
+                    "select":       [],
+                    "filters":      [],
+                    "chart": {
+                        "type":     "pie" if "pie" in q.lower() else "bar",
+                        "x_col":    best_col,
+                        "y_cols":   ["count"],
+                        "pivot_col": None,
+                    },
+                }
+                result = execute_plan(df, plan)
+                logging.info("_run_engine_fallback: grouped by '%s' → %d rows", best_col, len(result.get("rows", [])))
+                return result
+            except Exception as exc:
+                logging.warning("_run_engine_fallback failed: %s", exc)
+                return None
+
         engine_result = _run_engine(query, stored_sd)
+
+        # Retry with fallback if engine returned error or empty rows
+        if not engine_result or engine_result.get("type") == "error" or not engine_result.get("rows"):
+            logging.info("run_rag_pipeline: primary engine failed/empty — trying fallback groupby plan")
+            engine_result = _run_engine_fallback(query, stored_sd)
 
         if engine_result and engine_result.get("type") != "error":
             rows = engine_result.get("rows", [])
@@ -803,15 +843,6 @@ def run_rag_pipeline(
                 result = {k: v for k, v in engine_result.items() if k != "sources"}
                 _cache_result(cache_key, result)
                 return result
-
-        # FIX #5: For chart queries with structured data, return an error rather than
-        # falling through to prose RAG which will hallucinate chart values from text.
-        if any(k in q_lower for k in _CHART_KEYWORDS) and stored_sd:
-            logging.warning("run_rag_pipeline: structured engine failed for chart query — returning error instead of hallucinated prose chart")
-            return {
-                "type":   "text",
-                "answer": "Could not generate chart from the data. The query engine could not map your question to the dataset columns. Please try rephrasing, e.g. 'Show count by <column name> as a pie chart'.",
-            }
 
         logging.info("run_rag_pipeline: structured engine failed — falling back to prose RAG")
 
