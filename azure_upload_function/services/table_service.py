@@ -12,7 +12,7 @@ PARTITION_KEY = "documents"
 
 # Increment this when the structured_data schema changes.
 # Any stored record with a lower version will be auto-reprocessed.
-SCHEMA_VERSION = 8   # v8 = reprocess now re-indexes chunks + fixes stale search index
+SCHEMA_VERSION = 9   # v9 = exclude temp records from reprocess and structured data lookup
 
 _table_client: TableClient | None = None
 
@@ -161,17 +161,19 @@ class TableService:
         """
         Retrieve structured data — downloads from Blob Storage if URL exists,
         falls back to inline field. Returns None if stale or missing.
+        Only returns data from completed, non-temp documents.
         """
         try:
             safe_fname = filename.replace("'", "''")
+            base_filter = (
+                f"PartitionKey eq '{PARTITION_KEY}' and filename eq '{safe_fname}'"
+                f" and status eq 'completed' and temp eq false"
+            )
             if uploaded_by:
                 safe_owner = uploaded_by.replace("'", "''")
-                query_filter = (
-                    f"PartitionKey eq '{PARTITION_KEY}' and filename eq '{safe_fname}'"
-                    f" and uploaded_by eq '{safe_owner}'"
-                )
+                query_filter = base_filter + f" and uploaded_by eq '{safe_owner}'"
             else:
-                query_filter = f"PartitionKey eq '{PARTITION_KEY}' and filename eq '{safe_fname}'"
+                query_filter = base_filter
 
             entities = list(self._client.query_entities(query_filter=query_filter))
             if not entities:
@@ -233,12 +235,12 @@ class TableService:
 
     def get_stale_documents(self) -> list[dict]:
         """
-        Return all completed documents whose schema_version < SCHEMA_VERSION.
+        Return all completed, non-temp documents whose schema_version < SCHEMA_VERSION.
         Used by /reprocess endpoint to auto-update stale records.
         """
         try:
             entities = list(self._client.query_entities(
-                query_filter=f"PartitionKey eq '{PARTITION_KEY}' and status eq 'completed'"
+                query_filter=f"PartitionKey eq '{PARTITION_KEY}' and status eq 'completed' and temp eq false"
             ))
             stale = []
             for e in entities:
