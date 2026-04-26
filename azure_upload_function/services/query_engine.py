@@ -1532,11 +1532,21 @@ def get_series_from_data(data: list[dict], x_key: str = "") -> list[str]:
 def structured_to_df(structured: dict) -> pd.DataFrame:
     """
     Convert stored structured_data into a single flat DataFrame.
-    For multi-sheet Excel: concatenates all sheets then drops exact duplicate rows
-    (same values in every column) to avoid counting the same record twice.
+    For multi-sheet Excel: concatenates all sheets then drops exact duplicate rows.
+    NaN values are treated as equal for dedup purposes.
     """
     if not structured:
         return pd.DataFrame()
+
+    def _dedup(df: pd.DataFrame) -> pd.DataFrame:
+        before = len(df)
+        # fillna with sentinel so NaN==NaN for dedup, then restore
+        df_filled = df.fillna("__NA__")
+        mask = ~df_filled.duplicated()
+        df = df[mask].reset_index(drop=True)
+        if before - len(df):
+            logging.info("structured_to_df: removed %d exact duplicate rows", before - len(df))
+        return df
 
     sheets = structured.get("sheets", {})
     if sheets:
@@ -1548,16 +1558,12 @@ def structured_to_df(structured: dict) -> pd.DataFrame:
         if not frames:
             return pd.DataFrame()
         df = pd.concat(frames, ignore_index=True)
-        before = len(df)
-        df = df.drop_duplicates().reset_index(drop=True)
-        logging.info("structured_to_df: %d sheets → %d rows (%d exact dupes removed)",
-                     len(frames), len(df), before - len(df))
-        return df
+        return _dedup(df)
 
     rows = structured.get("rows", [])
     if rows:
         df = pd.DataFrame(rows).drop(columns=["_sheet"], errors="ignore")
-        return df.drop_duplicates().reset_index(drop=True)
+        return _dedup(df)
 
     if isinstance(structured, list):
         return pd.DataFrame(structured)
