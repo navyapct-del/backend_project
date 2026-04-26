@@ -818,9 +818,15 @@ def run_rag_pipeline(
                 logging.warning("_run_engine_fallback failed: %s", exc)
                 return None
 
-        engine_result = _run_engine(query, stored_sd)
+        # For distribution/pie/breakdown queries always use COUNT fallback directly —
+        # the LLM planner often misreads "distribution of X by Y" as SUM(X) instead of COUNT(*)
+        _is_distribution = any(k in q_lower for k in (
+            "distribution", "pie chart", "breakdown", "by category", "by department",
+            "how many", "count by", "number of",
+        ))
+        engine_result = _run_engine_fallback(query, stored_sd) if _is_distribution else _run_engine(query, stored_sd)
 
-        # Retry with fallback if engine returned error or empty rows
+        # Retry with fallback if primary engine returned error or empty rows
         if not engine_result or engine_result.get("type") == "error" or not engine_result.get("rows"):
             logging.info("run_rag_pipeline: primary engine failed/empty — trying fallback groupby plan")
             engine_result = _run_engine_fallback(query, stored_sd)

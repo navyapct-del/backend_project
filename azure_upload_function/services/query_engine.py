@@ -1531,25 +1531,24 @@ def get_series_from_data(data: list[dict], x_key: str = "") -> list[str]:
 
 def structured_to_df(structured: dict) -> pd.DataFrame:
     """
-    Convert stored structured_data (with optional 'sheets' key) into a
-    single flat DataFrame. Adds a '_sheet' column when merging multiple sheets.
+    Convert stored structured_data into a single flat DataFrame.
+    For multi-sheet Excel: uses the sheet with the most rows (avoids double-counting).
     """
     if not structured:
         return pd.DataFrame()
 
     sheets = structured.get("sheets", {})
     if sheets:
-        frames = []
-        for sname, sd in sheets.items():
-            df_s = pd.DataFrame(sd.get("rows", []))
-            if not df_s.empty:
-                df_s["_sheet"] = sname
-                frames.append(df_s)
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        # Use the sheet with the most rows — avoids concatenating duplicate data
+        best_sheet = max(sheets.values(), key=lambda s: len(s.get("rows", [])))
+        df = pd.DataFrame(best_sheet.get("rows", []))
+        return df if not df.empty else pd.DataFrame()
 
     rows = structured.get("rows", [])
     if rows:
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        # Drop the _sheet column added during extraction — it's metadata, not data
+        return df.drop(columns=["_sheet"], errors="ignore")
 
     if isinstance(structured, list):
         return pd.DataFrame(structured)

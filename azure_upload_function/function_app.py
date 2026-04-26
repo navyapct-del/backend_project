@@ -546,12 +546,22 @@ def reprocess(req: func.HttpRequest) -> func.HttpResponse:
                 # Re-extract with current logic
                 text, structured_data = extract_with_structured(file_bytes, filename)
 
+                # Upload new structured data to Blob (replaces old blob)
+                sd_url = ""
+                if structured_data:
+                    try:
+                        sd_url = blob_svc.upload_structured_data(doc["RowKey"], structured_data)
+                    except Exception as blob_exc:
+                        logging.warning("Reprocess: blob upload failed for %s: %s", filename, blob_exc)
+
                 # Update Table Storage with new schema
                 table_svc.update_ai_fields(
                     filename, text,
-                    summary         = "",   # keep existing summary (don't re-call OpenAI)
-                    tags            = "",
-                    structured_data = structured_data,
+                    summary             = "",
+                    tags                = "",
+                    record_id           = doc["RowKey"],
+                    structured_data     = structured_data if not sd_url else None,
+                    structured_data_url = sd_url,
                 )
                 logging.info("Reprocessed: %s → v%d", filename, SCHEMA_VERSION)
                 updated += 1
