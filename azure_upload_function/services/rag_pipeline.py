@@ -609,22 +609,30 @@ def run_rag_pipeline(
 
     Pipeline:
       1. Multi-query retrieval with HyDE
-      2. Contextual compression
-      3. Grounded generation with strict system prompt
-      4. Response formatting
+      2. Structured data lookup (full-file, not chunk-limited)
+      3. Intent classification
+      4. Structured engine (for tabular/chart queries) OR prose RAG
+      5. Contextual compression + grounded generation (prose path)
 
-    Returns a response dict with type, answer, sources, and optional
-    table/chart data.
+    Returns a response dict with type, answer, and optional table/chart data.
     """
     from services.table_service import TableService
+    import time as _time
 
     if not query or not query.strip():
         return {"type": "text", "answer": "No question provided."}
 
+    q_lower = query.lower()
+
+    # ── FIX #2: Boost top_k for structured/chart queries ─────────────────
+    # Chart and aggregation queries need more chunks to cover all categories.
+    is_chart_or_agg = any(k in q_lower for k in _CHART_KEYWORDS | _STRUCTURED_KEYWORDS)
+    effective_top_k = 15 if is_chart_or_agg else top_k
+
     # ── Step 1: Multi-query retrieval with HyDE ───────────────────────────
     chunks = multi_query_retrieve(
         query           = query,
-        top_k           = top_k,
+        top_k           = effective_top_k,
         filename_filter = filename_filter,
         uploaded_by     = uploaded_by,
         use_hyde        = use_hyde,
@@ -636,8 +644,7 @@ def run_rag_pipeline(
             "answer": "No relevant information found in this document.",
         }
 
-    # ── Step 2: Check cache ───────────────────────────────────────────────
-    import time as _time
+    # ── FIX #3: Cache key includes uploaded_by (already correct) ─────────
     cache_key = hashlib.md5((query + "|" + filename_filter + "|" + uploaded_by).encode()).hexdigest()
     cached = _pipeline_cache.get(cache_key)
     if cached:
@@ -646,150 +653,154 @@ def run_rag_pipeline(
             logging.info("run_rag_pipeline: cache hit")
             return result
         else:
-            del _pipeline_cache[cache_key]  # expired
+            del _pipeline_cache[cache_key]
 
-    # ── Step 3: Check for structured data (for analytical queries) ────────
-    # CRITICAL: match structured data to the query topic, not just "first with data"
+    # ── FIX #1 + #4: Structured data lookup — full-file, not chunk-limited ─
+    # When filename_filter is set: fetch directly (exact match, no scoring).
+    # When no filter: scan ALL user's documents for the best column-overlap match.
+    # This ensures InformationSage and SingleFileSathi use the same data source.
     table_svc = TableService()
     stored_sd = None
+    best_score = -1
 
-    q_lower   = query.lower()
-    q_words   = set(w.strip(".,!?;:()") for w in q_lower.split() if len(w) >= 3)
+    def _stem(w: str) -> str:
+        if w.endswith("ing") and len(w) > 5: return w[:-3]
+        if w.endswith("ies") and len(w) > 4: return w[:-3] + "y"
+        if w.endswith("es")  and len(w) > 4: return w[:-2]
+        if w.endswith("s")   and len(w) > 3: return w[:-1]
+        return w
 
-    def _sd_relevance_score(sd: dict, filename: str) -> int:
-        """Score how relevant a document's structured data is to the query."""
+    q_words        = set(w.strip(".,!?;:()") for w in q_lower.split() if len(w) >= 3)
+    stemmed_q      = {_stem(w) for w in q_words} | q_words
+
+    def _sd_score(sd: dict, filename: str) -> int:
+        """Column-overlap + filename-overlap score for structured data relevance."""
         score = 0
-        # Column name overlap with query words (stemmed: strip trailing s/es/ing)
         sd_columns = sd.get("columns", [])
         if not sd_columns and sd.get("sheets"):
             for sheet_data in sd["sheets"].values():
                 sd_columns = sheet_data.get("columns", [])
                 if sd_columns:
                     break
-
-        def _stem(w: str) -> str:
-            """Minimal suffix stripping for English plurals/gerunds."""
-            if w.endswith("ing") and len(w) > 5:
-                return w[:-3]
-            if w.endswith("ies") and len(w) > 4:
-                return w[:-3] + "y"
-            if w.endswith("es") and len(w) > 4:
-                return w[:-2]
-            if w.endswith("s") and len(w) > 3:
-                return w[:-1]
-            return w
-
-        stemmed_q_words = {_stem(w) for w in q_words} | q_words
-
         for col in sd_columns:
-            col_lower = col.lower().replace("_", " ").replace("-", " ")
-            col_words = set(col_lower.split())
-            stemmed_col_words = {_stem(w) for w in col_words} | col_words
-            for qw in stemmed_q_words:
-                # Substring match (stemmed)
-                if qw in col_lower or any(qw in cw or cw in qw for cw in stemmed_col_words):
+            col_norm = col.lower().replace("_", " ").replace("-", " ")
+            col_stemmed = {_stem(w) for w in col_norm.split()} | set(col_norm.split())
+            for qw in stemmed_q:
+                if qw in col_norm or any(qw in cw or cw in qw for cw in col_stemmed):
                     score += 3
                     break
-        # Filename overlap with query words (stemmed)
-        fname_lower = filename.lower().replace("_", " ").replace("-", " ")
-        for qw in stemmed_q_words:
-            if qw in fname_lower:
+        fname_norm = filename.lower().replace("_", " ").replace("-", " ")
+        for qw in stemmed_q:
+            if qw in fname_norm:
                 score += 5
                 break
-        # Chart/aggregation keywords get a base score only if structured data has numeric columns
-        chart_agg_kw = {"chart", "graph", "plot", "total", "sum", "average",
-                        "count", "max", "min", "distribution", "breakdown"}
-        numeric_cols = [c for c in sd_columns if any(
-            isinstance(v, (int, float)) for v in [] # checked at query time
-        )]
-        if any(k in q_lower for k in chart_agg_kw) and sd_columns:
+        # Any chart/agg keyword + has columns → base relevance
+        if any(k in q_lower for k in _CHART_KEYWORDS | {"total","sum","average","count","distribution","breakdown"}) and sd_columns:
             score += 1
         return score
 
-    # When a specific file is requested, use its structured data directly (no scoring needed)
     if filename_filter:
-        stored_sd = table_svc.get_structured_data(filename_filter, uploaded_by=uploaded_by)
-        if stored_sd:
-            logging.info("run_rag_pipeline: using structured data directly from filename_filter='%s'", filename_filter)
+        # Exact file requested — use it directly
+        stored_sd  = table_svc.get_structured_data(filename_filter, uploaded_by=uploaded_by)
         best_score = 1 if stored_sd else -1
+        if stored_sd:
+            logging.info("run_rag_pipeline: structured data from filename_filter='%s'", filename_filter)
     else:
-        # Score all retrieved documents' structured data and pick the best match
-        best_score = -1
+        # FIX #4: scan ALL user documents, not just retrieved chunks
+        # This is the key fix: InformationSage now sees the same full-file data as SingleFileSathi
+        candidate_filenames: set[str] = set()
+
+        # Candidates from retrieved chunks (fast path)
         for chunk in chunks:
             fname = chunk.get("filename", "")
-            if not fname:
-                continue
+            if fname:
+                candidate_filenames.add(fname)
+
+        # Also scan all user's documents (catches files not in top chunks)
+        if uploaded_by and is_chart_or_agg:
+            try:
+                all_docs = table_svc.list_documents_by_user(uploaded_by)
+                for doc in all_docs:
+                    if doc.get("filename"):
+                        candidate_filenames.add(doc["filename"])
+            except Exception as exc:
+                logging.warning("run_rag_pipeline: list_documents_by_user failed: %s", exc)
+
+        for fname in candidate_filenames:
             sd = table_svc.get_structured_data(fname, uploaded_by=uploaded_by)
             if not sd:
                 continue
-            score = _sd_relevance_score(sd, fname)
-            logging.info("run_rag_pipeline: structured data relevance '%s' score=%d", fname, score)
+            score = _sd_score(sd, fname)
+            logging.info("run_rag_pipeline: sd relevance '%s' score=%d", fname, score)
             if score > best_score:
                 best_score = score
                 stored_sd  = sd
-                logging.info("run_rag_pipeline: selected structured data from '%s' (score=%d)", fname, score)
+                logging.info("run_rag_pipeline: selected sd from '%s' (score=%d)", fname, score)
 
-    # Only use structured data if it has meaningful relevance to the query
     if best_score <= 0:
         stored_sd = None
-        logging.info("run_rag_pipeline: no relevant structured data found — using prose RAG")
+        logging.info("run_rag_pipeline: no relevant structured data — using prose RAG")
 
-    # ── Step 5: Intent classification ────────────────────────────────────
+    # ── Step 3: Intent classification ────────────────────────────────────
     intent = classify_intent(query, has_structured_data=stored_sd is not None)
     logging.info("run_rag_pipeline: intent=%s has_sd=%s", intent, stored_sd is not None)
 
-    # ── Step 6: Route to structured engine or prose RAG ──────────────────
+    # ── FIX #5: Structured engine path — never fall through to prose RAG for charts ─
+    # Prose RAG invents chart data from text; structured engine uses real row data.
     if intent == "structured" and stored_sd:
-        from services.query_engine import generate_plan, execute_plan, structured_to_df
-        import pandas as pd
-        import json as _json
+        from services.query_engine import generate_plan, execute_plan, structured_to_df, promote_to_chart
 
-        def _run_engine_local(query: str, structured: dict) -> dict | None:
+        def _run_engine(q: str, sd: dict) -> dict | None:
             try:
-                df = structured_to_df(structured)
+                df = structured_to_df(sd)
                 if df.empty:
                     return None
-                df      = df.drop(columns=[c for c in df.columns if c.startswith("_")], errors="ignore")
-                cols    = list(df.columns)
-                plan    = generate_plan(query, cols)
-                result  = execute_plan(df, plan)
-                return result
+                df   = df.drop(columns=[c for c in df.columns if c.startswith("_")], errors="ignore")
+                plan = generate_plan(q, list(df.columns))
+                return execute_plan(df, plan)
             except Exception as exc:
-                logging.warning("_run_engine_local failed: %s", exc)
+                logging.warning("_run_engine failed: %s", exc)
                 return None
 
-        engine_result = _run_engine_local(query, stored_sd)
+        engine_result = _run_engine(query, stored_sd)
+
         if engine_result and engine_result.get("type") != "error":
             rows = engine_result.get("rows", [])
             if rows or engine_result.get("type") == "text":
-                # Promote to chart with correct type if query has chart intent
-                if engine_result.get("type") != "chart":
-                    from services.query_engine import promote_to_chart
+                # Promote table → chart when user asked for a chart
+                if engine_result.get("type") != "chart" and any(k in q_lower for k in _CHART_KEYWORDS):
                     try:
                         df   = structured_to_df(stored_sd)
-                        cols = list(df.columns)
-                        plan = generate_plan(query, cols)
-                        if any(k in query.lower() for k in _CHART_KEYWORDS) and plan.get("group_by"):
+                        plan = generate_plan(query, list(df.columns))
+                        if plan.get("group_by"):
                             engine_result = promote_to_chart(engine_result, query)
                     except Exception:
                         pass
-                # Clean chart data if applicable (Shape A: labels/values)
+                # Clean chart data (labels/values shape)
                 if engine_result.get("type") == "chart" and engine_result.get("labels"):
                     engine_result = _clean_chart_data(engine_result, user_query=query)
                 result = {k: v for k, v in engine_result.items() if k != "sources"}
                 _cache_result(cache_key, result)
                 return result
-        # Fall through to prose RAG if engine fails
+
+        # FIX #5: For chart queries with structured data, return an error rather than
+        # falling through to prose RAG which will hallucinate chart values from text.
+        if any(k in q_lower for k in _CHART_KEYWORDS) and stored_sd:
+            logging.warning("run_rag_pipeline: structured engine failed for chart query — returning error instead of hallucinated prose chart")
+            return {
+                "type":   "text",
+                "answer": "Could not generate chart from the data. The query engine could not map your question to the dataset columns. Please try rephrasing, e.g. 'Show count by <column name> as a pie chart'.",
+            }
+
         logging.info("run_rag_pipeline: structured engine failed — falling back to prose RAG")
 
-    # ── Step 7: Contextual compression ───────────────────────────────────
+    # ── Step 5: Contextual compression ───────────────────────────────────
     if use_compression and len(chunks) > 2:
         compressed_chunks = compress_chunks(query, chunks)
     else:
         compressed_chunks = chunks
 
-    # ── Step 8: Grounded generation ───────────────────────────────────────
-    q_lower = query.lower()
+    # ── Step 6: Grounded generation ───────────────────────────────────────
     if intent == "hybrid":
         response_format = "table"
     elif any(k in q_lower for k in _CHART_KEYWORDS):
@@ -805,7 +816,7 @@ def run_rag_pipeline(
         response_format = response_format,
     )
 
-    # ── Step 9: Cache and return ──────────────────────────────────────────
+    # ── Step 7: Cache and return ──────────────────────────────────────────
     _cache_result(cache_key, result)
     return result
 
