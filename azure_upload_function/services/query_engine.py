@@ -1532,8 +1532,8 @@ def get_series_from_data(data: list[dict], x_key: str = "") -> list[str]:
 def structured_to_df(structured: dict) -> pd.DataFrame:
     """
     Convert stored structured_data into a single flat DataFrame.
-    For multi-sheet Excel: concatenates all sheets then deduplicates by the
-    first string column (typically Name/ID) to avoid counting the same record twice.
+    For multi-sheet Excel: concatenates all sheets then drops exact duplicate rows
+    (same values in every column) to avoid counting the same record twice.
     """
     if not structured:
         return pd.DataFrame()
@@ -1548,24 +1548,16 @@ def structured_to_df(structured: dict) -> pd.DataFrame:
         if not frames:
             return pd.DataFrame()
         df = pd.concat(frames, ignore_index=True)
-        # Deduplicate: use first string column (Name/ID) + second string column as key
-        # This removes the same employee appearing in multiple sheets
-        str_cols = df.select_dtypes(include="object").columns.tolist()
-        if len(str_cols) >= 2:
-            df = df.drop_duplicates(subset=str_cols[:2]).reset_index(drop=True)
-        elif str_cols:
-            df = df.drop_duplicates(subset=str_cols[:1]).reset_index(drop=True)
-        logging.info("structured_to_df: %d sheets → %d rows after dedup", len(frames), len(df))
+        before = len(df)
+        df = df.drop_duplicates().reset_index(drop=True)
+        logging.info("structured_to_df: %d sheets → %d rows (%d exact dupes removed)",
+                     len(frames), len(df), before - len(df))
         return df
 
     rows = structured.get("rows", [])
     if rows:
-        df = pd.DataFrame(rows)
-        df = df.drop(columns=["_sheet"], errors="ignore")
-        str_cols = df.select_dtypes(include="object").columns.tolist()
-        if len(str_cols) >= 2:
-            df = df.drop_duplicates(subset=str_cols[:2]).reset_index(drop=True)
-        return df
+        df = pd.DataFrame(rows).drop(columns=["_sheet"], errors="ignore")
+        return df.drop_duplicates().reset_index(drop=True)
 
     if isinstance(structured, list):
         return pd.DataFrame(structured)
