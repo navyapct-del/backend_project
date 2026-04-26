@@ -718,17 +718,19 @@ def run_rag_pipeline(
         if stored_sd:
             logging.info("run_rag_pipeline: structured data from filename_filter='%s'", filename_filter)
     else:
-        # FIX #4: scan ALL user documents, not just retrieved chunks
-        # This is the key fix: InformationSage now sees the same full-file data as SingleFileSathi
+        # Scan ALL user documents for best match.
+        # Composite score = column overlap + retrieval score (tiebreaker when query is generic).
         candidate_filenames: set[str] = set()
 
-        # Candidates from retrieved chunks (fast path)
+        # Build retrieval score map: filename → best chunk score from vector search
+        chunk_score_map: dict[str, float] = {}
         for chunk in chunks:
             fname = chunk.get("filename", "")
             if fname:
                 candidate_filenames.add(fname)
+                chunk_score_map[fname] = max(chunk_score_map.get(fname, 0.0), chunk.get("score", 0.0))
 
-        # Also scan all user's documents (catches files not in top chunks)
+        # Also scan all user's documents for chart/agg queries
         if uploaded_by and is_chart_or_agg:
             try:
                 all_docs = table_svc.list_documents_by_user(uploaded_by)
@@ -738,18 +740,25 @@ def run_rag_pipeline(
             except Exception as exc:
                 logging.warning("run_rag_pipeline: list_documents_by_user failed: %s", exc)
 
+        best_composite = -1.0
         for fname in candidate_filenames:
             sd = table_svc.get_structured_data(fname, uploaded_by=uploaded_by)
             if not sd:
                 continue
-            score = _sd_score(sd, fname)
-            logging.info("run_rag_pipeline: sd relevance '%s' score=%d", fname, score)
-            if score > best_score:
-                best_score = score
-                stored_sd  = sd
-                logging.info("run_rag_pipeline: selected sd from '%s' (score=%d)", fname, score)
+            col_score    = _sd_score(sd, fname)
+            # Composite = column overlap + retrieval score weighted 2x as tiebreaker
+            retrieval_sc = chunk_score_map.get(fname, 0.0)
+            composite    = col_score + retrieval_sc * 2.0
+            logging.info("run_rag_pipeline: sd '%s' col_score=%d retrieval=%.3f composite=%.3f",
+                         fname, col_score, retrieval_sc, composite)
+            if composite > best_composite:
+                best_composite = composite
+                best_score     = col_score
+                stored_sd      = sd
+                logging.info("run_rag_pipeline: selected sd from '%s' (composite=%.3f)", fname, composite)
 
-    if best_score <= 0:
+    # Accept any structured data with a positive signal (col overlap OR retrieval hit)
+    if best_score < 0:
         stored_sd = None
         logging.info("run_rag_pipeline: no relevant structured data — using prose RAG")
 
