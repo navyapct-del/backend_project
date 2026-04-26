@@ -477,7 +477,7 @@ class TableService:
             safe = uploaded_by.replace("'", "''")
             entities = list(self._client.query_entities(
                 query_filter=f"PartitionKey eq '{PARTITION_KEY}' and uploaded_by eq '{safe}'",
-                select=["RowKey", "filename", "summary", "tags", "blob_url", "status", "created_at", "uploaded_by"],
+                select=["RowKey", "filename", "summary", "tags", "blob_url", "status", "created_at", "uploaded_by", "temp"],
             ))
             docs = [{
                 "id":          e.get("RowKey", ""),
@@ -605,3 +605,14 @@ def get_user(email: str) -> dict | None:
                 "first_name": e.get("first_name", ""), "last_name": e.get("last_name", "")}
     except Exception:
         return None
+
+def update_user_password(email: str, new_password_hash: str) -> bool:
+    """Returns False if user does not exist."""
+    client = _get_users_client()
+    try:
+        entity = client.get_entity(partition_key="users", row_key=email)
+    except Exception:
+        return False
+    entity["password"] = new_password_hash
+    client.update_entity(entity, mode="merge")
+    return True

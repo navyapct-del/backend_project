@@ -236,7 +236,11 @@ def vector_search(
     except Exception:
         pass
 
-    if filename_filter:
+    if filename_filter and uploaded_by:
+        safe = uploaded_by.replace("'", "''")
+        fn   = filename_filter.replace("'", "''")
+        search_kwargs["filter"] = f"uploaded_by eq '{safe}' and filename eq '{fn}'"
+    elif filename_filter:
         search_kwargs["filter"] = f"filename eq '{filename_filter}'"
     elif uploaded_by:
         safe = uploaded_by.replace("'", "''")

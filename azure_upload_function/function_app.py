@@ -674,6 +674,40 @@ def login(req: func.HttpRequest) -> func.HttpResponse:
                                  status_code=500, mimetype="application/json")
 
 
+# ---------------------------------------------------------------------------
+# POST /forgot-password  { email, new_password }
+# ---------------------------------------------------------------------------
+
+@app.route(route="forgot-password", methods=["POST"])
+def forgot_password(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        body         = req.get_json()
+        email        = (body.get("email") or "").strip().lower()
+        new_password = body.get("new_password") or ""
+        if not email or not new_password:
+            return func.HttpResponse(json.dumps({"error": "email and new_password required"}),
+                                     status_code=400, mimetype="application/json")
+        import re, bcrypt
+        if (len(new_password) < 8 or not re.search(r'[A-Z]', new_password) or
+            not re.search(r'[a-z]', new_password) or not re.search(r'[0-9]', new_password) or
+            not re.search(r'[!@#$%^&*(),.?":{}|<>]', new_password)):
+            return func.HttpResponse(
+                json.dumps({"error": "Password must be 8+ chars with uppercase, lowercase, number and special character"}),
+                status_code=400, mimetype="application/json")
+        from services.table_service import get_user, update_user_password
+        if not get_user(email):
+            return func.HttpResponse(json.dumps({"error": "No account found with that email"}),
+                                     status_code=404, mimetype="application/json")
+        pw_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+        update_user_password(email, pw_hash)
+        return func.HttpResponse(json.dumps({"message": "Password updated"}),
+                                 status_code=200, mimetype="application/json")
+    except Exception:
+        logging.exception("/forgot-password error")
+        return func.HttpResponse(json.dumps({"error": "Password reset failed"}),
+                                 status_code=500, mimetype="application/json")
+
+
 # GET /documents — list from Table Storage (lightweight, for UI polling)
 # ---------------------------------------------------------------------------
 
