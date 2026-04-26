@@ -1072,12 +1072,14 @@ def serve_file(req: func.HttpRequest) -> func.HttpResponse:
             "doc": "application/msword",
         }
         content_type = mime_map.get(ext, "application/octet-stream")
+        inline_types = {"text/plain", "text/csv", "image/jpeg", "image/png", "image/gif", "image/webp", "image/svg+xml", "application/pdf"}
+        disposition  = "inline" if content_type in inline_types else f'attachment; filename="{filename}"'
 
         return func.HttpResponse(
             body=data,
             status_code=200,
             mimetype=content_type,
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers={"Content-Disposition": disposition},
         )
     except Exception as exc:
         logging.exception("serve_file error.")
