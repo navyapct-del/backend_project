@@ -22,16 +22,30 @@ _search_client = None
 _index_client  = None
 
 
+def _get_credential():
+    search_key = get_env("AZURE_SEARCH_KEY")
+    if search_key:
+        from azure.core.credentials import AzureKeyCredential
+        return AzureKeyCredential(search_key)
+    from azure.identity import DefaultAzureCredential
+    logging.info("AZURE_SEARCH_KEY not set — using DefaultAzureCredential")
+    return DefaultAzureCredential()
+
+
 def _get_search_client():
     global _search_client
     if _search_client is None:
         from azure.search.documents import SearchClient
-        from azure.core.credentials import AzureKeyCredential
-        _search_client = SearchClient(
-            endpoint   = require_env("AZURE_SEARCH_ENDPOINT").rstrip("/"),
-            index_name = SEARCH_INDEX,
-            credential = AzureKeyCredential(require_env("AZURE_SEARCH_KEY")),
-        )
+        endpoint = require_env("AZURE_SEARCH_ENDPOINT").rstrip("/")
+        logging.info("Search endpoint: %s", endpoint)
+        try:
+            _search_client = SearchClient(
+                endpoint=endpoint,
+                index_name=SEARCH_INDEX,
+                credential=_get_credential(),
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Search service unreachable. Check configuration. ({exc})")
     return _search_client
 
 
@@ -39,11 +53,14 @@ def _get_index_client():
     global _index_client
     if _index_client is None:
         from azure.search.documents.indexes import SearchIndexClient
-        from azure.core.credentials import AzureKeyCredential
-        _index_client = SearchIndexClient(
-            endpoint   = require_env("AZURE_SEARCH_ENDPOINT").rstrip("/"),
-            credential = AzureKeyCredential(require_env("AZURE_SEARCH_KEY")),
-        )
+        endpoint = require_env("AZURE_SEARCH_ENDPOINT").rstrip("/")
+        try:
+            _index_client = SearchIndexClient(
+                endpoint=endpoint,
+                credential=_get_credential(),
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Search service unreachable. Check configuration. ({exc})")
     return _index_client
 
 
