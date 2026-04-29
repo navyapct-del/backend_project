@@ -337,9 +337,7 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
         t0   = time.time()
         try:
             text, structured_data = extract_with_structured(file_bytes, filename)
-        except RuntimeError as extraction_err:
-            # Images with no detectable text raise RuntimeError("too little text").
-            # Fall back to filename-based text so the upload can still complete.
+        except Exception as extraction_err:
             logging.warning("Extraction warning for '%s': %s — using filename fallback", filename, extraction_err)
             text            = filename
             structured_data = None
@@ -772,6 +770,37 @@ def documents(req: func.HttpRequest) -> func.HttpResponse:
 # ---------------------------------------------------------------------------
 # GET /diagnose — raw Table Storage state for debugging
 # ---------------------------------------------------------------------------
+
+@app.route(route="test-extract", methods=["GET"])
+def test_extract(req: func.HttpRequest) -> func.HttpResponse:
+    """Diagnostic: test full extraction on the first xlsx in storage."""
+    import traceback
+    try:
+        from services.blob_service import BlobService
+        from services.extractor import extract_with_structured
+        from azure.storage.blob import BlobServiceClient
+        conn_str = require_env("AZURE_STORAGE_CONNECTION_STRING")
+        bsc = BlobServiceClient.from_connection_string(conn_str)
+        cc = bsc.get_container_client("documents")
+        blobs = [b for b in cc.list_blobs() if b.name.endswith('.xlsx') and not b.name.startswith('temp/')]
+        if not blobs:
+            blobs = [b for b in cc.list_blobs() if b.name.endswith('.xlsx')]
+        if not blobs:
+            return func.HttpResponse(json.dumps({"error": "no xlsx found"}), status_code=404, mimetype="application/json")
+        blob = blobs[0]
+        data = cc.get_blob_client(blob.name).download_blob().readall()
+        text, sd = extract_with_structured(data, blob.name)
+        result = {
+            "blob": blob.name,
+            "text_len": len(text),
+            "structured": sd is not None,
+            "sheets": list(sd.get("sheets", {}).keys()) if sd else [],
+            "row_count": sum(len(v.get("rows",[])) for v in sd.get("sheets",{}).values()) if sd else 0,
+        }
+        return func.HttpResponse(json.dumps(result), status_code=200, mimetype="application/json")
+    except Exception as exc:
+        return func.HttpResponse(json.dumps({"error": str(exc), "trace": traceback.format_exc()[-800:]}), status_code=500, mimetype="application/json")
+
 
 @app.route(route="test-upload", methods=["GET"])
 def test_upload(req: func.HttpRequest) -> func.HttpResponse:
