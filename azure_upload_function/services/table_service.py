@@ -167,7 +167,7 @@ class TableService:
             safe_fname = filename.replace("'", "''")
             base_filter = (
                 f"PartitionKey eq '{PARTITION_KEY}' and filename eq '{safe_fname}'"
-                f" and status eq 'completed' and temp eq false"
+                f" and status eq 'completed'"
             )
             if uploaded_by:
                 safe_owner = uploaded_by.replace("'", "''")
