@@ -14,7 +14,7 @@ import logging
 from services.config import require_env, get_env
 
 SEARCH_INDEX = "documents-index-v2"   # new index with vector field
-MIN_SCORE    = 0.30                    # minimum relevance score — filters clearly irrelevant chunks
+MIN_SCORE    = 0.01                    # minimum relevance score — filters clearly irrelevant chunks
 _TOP_K       = 7                       # chunks returned to LLM
 
 # Lazy SDK client
