@@ -773,6 +773,25 @@ def documents(req: func.HttpRequest) -> func.HttpResponse:
 # GET /diagnose — raw Table Storage state for debugging
 # ---------------------------------------------------------------------------
 
+@app.route(route="test-upload", methods=["GET"])
+def test_upload(req: func.HttpRequest) -> func.HttpResponse:
+    """Diagnostic: test structured data blob upload."""
+    import traceback
+    try:
+        from services.blob_service import BlobService
+        bs = BlobService()
+        test_data = {"columns": ["Name", "Salary"], "rows": [{"Name": "Test", "Salary": "100"}] * 1000}
+        url = bs.upload_structured_data("test-diag-id", test_data)
+        # Clean up
+        try:
+            bs._client.get_blob_client("metadata", "test-diag-id/structured_data.json").delete_blob()
+        except Exception:
+            pass
+        return func.HttpResponse(json.dumps({"ok": True, "url": url}), status_code=200, mimetype="application/json")
+    except Exception as exc:
+        return func.HttpResponse(json.dumps({"ok": False, "error": str(exc), "trace": traceback.format_exc()[-500:]}), status_code=500, mimetype="application/json")
+
+
 @app.route(route="test-embed", methods=["GET"])
 def test_embed(req: func.HttpRequest) -> func.HttpResponse:
     """Diagnostic: test embedding generation and return result."""
