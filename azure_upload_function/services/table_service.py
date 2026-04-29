@@ -12,7 +12,7 @@ PARTITION_KEY = "documents"
 
 # Increment this when the structured_data schema changes.
 # Any stored record with a lower version will be auto-reprocessed.
-SCHEMA_VERSION = 9   # v9 = exclude temp records from reprocess and structured data lookup
+SCHEMA_VERSION = 10  # v10 = force re-embed all chunks with corrected OpenAI endpoint
 
 _table_client: TableClient | None = None
 
