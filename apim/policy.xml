@@ -3,7 +3,7 @@
     <base />
     <cors allow-credentials="true">
       <allowed-origins>
-        <origin>https://agreeable-glacier-0b749ee0f.7.azurestaticapps.net</origin>
+        <origin>https://icy-island-094f9fb0f.7.azurestaticapps.net</origin>
         <origin>http://localhost:5173</origin>
         <origin>http://localhost:3000</origin>
       </allowed-origins>
