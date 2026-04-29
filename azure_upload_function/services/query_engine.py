@@ -1556,16 +1556,26 @@ def structured_to_df(structured: dict) -> pd.DataFrame:
             df = df[~df_filled.duplicated()].reset_index(drop=True)
             logging.info("structured_to_df: %d sheets → %d rows (%d cross-sheet dupes removed)",
                          len(frames), len(df), before - len(df))
-        return df
+        return _infer_numeric(df)
 
     rows = structured.get("rows", [])
     if rows:
-        return pd.DataFrame(rows).drop(columns=["_sheet"], errors="ignore")
+        df = pd.DataFrame(rows).drop(columns=["_sheet"], errors="ignore")
+        return _infer_numeric(df)
 
     if isinstance(structured, list):
-        return pd.DataFrame(structured)
+        return _infer_numeric(pd.DataFrame(structured))
 
     return pd.DataFrame()
+
+
+def _infer_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    """Try to convert string columns to numeric where possible."""
+    for col in df.columns:
+        converted = pd.to_numeric(df[col], errors="coerce")
+        if converted.notna().sum() > len(df) * 0.5:  # majority are numeric
+            df[col] = converted
+    return df
 
 
 # ---------------------------------------------------------------------------
