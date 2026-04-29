@@ -773,6 +773,24 @@ def documents(req: func.HttpRequest) -> func.HttpResponse:
 # GET /diagnose — raw Table Storage state for debugging
 # ---------------------------------------------------------------------------
 
+@app.route(route="test-embed", methods=["GET"])
+def test_embed(req: func.HttpRequest) -> func.HttpResponse:
+    """Diagnostic: test embedding generation and return result."""
+    import os
+    try:
+        from services.openai_service import generate_embedding
+        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "NOT SET")
+        vec = generate_embedding("hello world test")
+        return func.HttpResponse(
+            json.dumps({"endpoint": endpoint, "embedding_len": len(vec), "ok": len(vec) > 0}),
+            status_code=200, mimetype="application/json")
+    except Exception as exc:
+        import os
+        return func.HttpResponse(
+            json.dumps({"error": str(exc), "endpoint": os.getenv("AZURE_OPENAI_ENDPOINT", "NOT SET")}),
+            status_code=500, mimetype="application/json")
+
+
 @app.route(route="diagnose", methods=["GET"])
 def diagnose(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("GET /diagnose")
