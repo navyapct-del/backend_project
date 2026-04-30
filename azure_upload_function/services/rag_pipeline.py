@@ -829,7 +829,11 @@ def run_rag_pipeline(
 
         # For distribution/pie/breakdown queries always use COUNT fallback directly —
         # the LLM planner often misreads "distribution of X by Y" as SUM(X) instead of COUNT(*)
-        _is_distribution = any(k in q_lower for k in (
+        # But NOT when the query asks for avg/sum/total — those need the real engine.
+        _has_agg_intent = any(k in q_lower for k in (
+            "average", "avg", "mean", "sum", "total", "highest", "lowest", "top", "bottom", "max", "min",
+        ))
+        _is_distribution = not _has_agg_intent and any(k in q_lower for k in (
             "distribution", "pie chart", "breakdown", "by category", "by department",
             "how many", "count by", "number of",
         ))
