@@ -429,6 +429,7 @@ def _excel_to_text_and_struct(file_bytes: bytes) -> tuple[str, dict]:
 
     return "\n\n".join(parts), {
         "columns": columns,
+        "rows":    all_rows,
         "sheets":  sheets,
     }
 
