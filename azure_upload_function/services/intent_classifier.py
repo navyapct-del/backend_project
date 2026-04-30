@@ -74,6 +74,23 @@ IMAGE_QA_SIGNALS = [
     "ocr this",
     "what is happening in",
     "what is shown",
+    # Person identification
+    "who is this",
+    "who is that",
+    "who are they",
+    "who is he",
+    "who is she",
+    "identify this person",
+    "identify the person",
+    "identify him",
+    "identify her",
+    "name this person",
+    "tell me about this person",
+    "which person is this",
+    "what is his name",
+    "what is her name",
+    "whose photo is this",
+    "whose image is this",
 ]
 
 DOCUMENT_QA_SIGNALS = [
