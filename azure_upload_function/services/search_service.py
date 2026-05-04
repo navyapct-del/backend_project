@@ -14,7 +14,7 @@ import logging
 from services.config import require_env, get_env
 
 SEARCH_INDEX = "documents-index-v2"   # new index with vector field
-MIN_SCORE    = 0.01                    # minimum relevance score — filters clearly irrelevant chunks
+MIN_SCORE    = 0.01                    # minimum relevance score — low to support free-tier BM25 (no semantic reranker)
 _TOP_K       = 7                       # chunks returned to LLM
 
 # Lazy SDK client
@@ -22,30 +22,16 @@ _search_client = None
 _index_client  = None
 
 
-def _get_credential():
-    search_key = get_env("AZURE_SEARCH_KEY")
-    if search_key:
-        from azure.core.credentials import AzureKeyCredential
-        return AzureKeyCredential(search_key)
-    from azure.identity import DefaultAzureCredential
-    logging.info("AZURE_SEARCH_KEY not set — using DefaultAzureCredential")
-    return DefaultAzureCredential()
-
-
 def _get_search_client():
     global _search_client
     if _search_client is None:
         from azure.search.documents import SearchClient
-        endpoint = require_env("AZURE_SEARCH_ENDPOINT").rstrip("/")
-        logging.info("Search endpoint: %s", endpoint)
-        try:
-            _search_client = SearchClient(
-                endpoint=endpoint,
-                index_name=SEARCH_INDEX,
-                credential=_get_credential(),
-            )
-        except Exception as exc:
-            raise RuntimeError(f"Search service unreachable. Check configuration. ({exc})")
+        from azure.core.credentials import AzureKeyCredential
+        _search_client = SearchClient(
+            endpoint   = require_env("AZURE_SEARCH_ENDPOINT").rstrip("/"),
+            index_name = SEARCH_INDEX,
+            credential = AzureKeyCredential(require_env("AZURE_SEARCH_KEY")),
+        )
     return _search_client
 
 
@@ -53,14 +39,11 @@ def _get_index_client():
     global _index_client
     if _index_client is None:
         from azure.search.documents.indexes import SearchIndexClient
-        endpoint = require_env("AZURE_SEARCH_ENDPOINT").rstrip("/")
-        try:
-            _index_client = SearchIndexClient(
-                endpoint=endpoint,
-                credential=_get_credential(),
-            )
-        except Exception as exc:
-            raise RuntimeError(f"Search service unreachable. Check configuration. ({exc})")
+        from azure.core.credentials import AzureKeyCredential
+        _index_client = SearchIndexClient(
+            endpoint   = require_env("AZURE_SEARCH_ENDPOINT").rstrip("/"),
+            credential = AzureKeyCredential(require_env("AZURE_SEARCH_KEY")),
+        )
     return _index_client
 
 
@@ -163,7 +146,6 @@ def index_document(
     if embedding:
         doc["embedding"] = embedding
 
-    last_exc = None
     from time import sleep
     for attempt in range(1, retries + 1):
         try:
@@ -173,12 +155,25 @@ def index_document(
                 return
             logging.warning("index_document attempt %d/%d failed", attempt, retries)
         except Exception as exc:
-            last_exc = exc
             logging.warning("index_document attempt %d/%d: %s", attempt, retries, exc)
         if attempt < retries:
             sleep(2 ** attempt)
 
-    raise RuntimeError(f"Indexing failed for {record_id} after {retries} attempts: {last_exc}")
+    raise RuntimeError(f"Indexing failed for {record_id} after {retries} attempts")
+
+
+def get_indexed_doc_ids() -> set:
+    """Return the set of doc_ids that have at least one chunk in the search index."""
+    try:
+        results = list(_get_search_client().search(
+            search_text="*",
+            select=["doc_id"],
+            top=1000,
+        ))
+        return {r["doc_id"] for r in results if r.get("doc_id")}
+    except Exception:
+        logging.exception("get_indexed_doc_ids failed")
+        return set()
 
 
 def backfill_uploaded_by(doc_id_to_owner: dict[str, str]) -> int:
@@ -255,29 +250,37 @@ def vector_search(
     except Exception:
         pass
 
-    if filename_filter and uploaded_by:
-        safe = uploaded_by.replace("'", "''")
-        fn   = filename_filter.replace("'", "''")
-        search_kwargs["filter"] = f"uploaded_by eq '{safe}' and filename eq '{fn}'"
-    elif filename_filter:
+    if filename_filter:
         search_kwargs["filter"] = f"filename eq '{filename_filter}'"
     elif uploaded_by:
         safe = uploaded_by.replace("'", "''")
         search_kwargs["filter"] = f"uploaded_by eq '{safe}'"
 
-    try:
-        results = list(_get_search_client().search(**search_kwargs))
-    except Exception as exc:
-        # Semantic not available on free tier — retry without it
-        logging.warning("Semantic search failed (%s), retrying without semantic.", exc)
-        search_kwargs.pop("query_type", None)
-        search_kwargs.pop("semantic_configuration_name", None)
-        search_kwargs.pop("query_caption", None)
+    def _run_search(kwargs: dict) -> list:
         try:
-            results = list(_get_search_client().search(**search_kwargs))
-        except Exception:
-            logging.exception("Hybrid search failed.")
-            return []
+            return list(_get_search_client().search(**kwargs))
+        except Exception as exc:
+            # Semantic not available on free tier — retry without it
+            logging.warning("Semantic search failed (%s), retrying without semantic.", exc)
+            kw = {k: v for k, v in kwargs.items()
+                  if k not in ("query_type", "semantic_configuration_name", "query_caption")}
+            try:
+                return list(_get_search_client().search(**kw))
+            except Exception:
+                logging.exception("Hybrid search failed.")
+                return []
+
+    results = _run_search(search_kwargs)
+
+    # If uploaded_by filter returned nothing, the index may not have that field populated
+    # (e.g. documents uploaded before backfill). Retry without the filter so users can
+    # still query their documents.
+    if not results and uploaded_by and not filename_filter:
+        logging.warning(
+            "vector_search: uploaded_by filter returned no results — retrying without filter"
+        )
+        fallback_kwargs = {k: v for k, v in search_kwargs.items() if k != "filter"}
+        results = _run_search(fallback_kwargs)
 
     chunks = []
     for r in results:

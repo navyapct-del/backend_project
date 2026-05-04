@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from threading import Lock
 from typing import Optional
 
 from azure.data.tables import TableServiceClient, TableClient
@@ -14,6 +15,20 @@ from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 
 TABLE_NAME = "ChatMessages"
 BLOB_CONTAINER = "chat-history"
+
+# Monotonic counter ensures RowKeys are strictly ordered even when two messages
+# are saved within the same microsecond (e.g. user + assistant in one request).
+_row_key_lock    = Lock()
+_row_key_counter = 0
+
+
+def _next_row_key() -> str:
+    global _row_key_counter
+    with _row_key_lock:
+        now = datetime.now(timezone.utc)
+        _row_key_counter += 1
+        seq = _row_key_counter
+    return now.strftime("%Y%m%dT%H%M%S%f") + f"{seq:06d}Z"
 
 
 def _get_connection_string() -> str:
@@ -51,8 +66,9 @@ def _get_blob_container_client():
 def save_message_to_table(user_id: str, session_id: str, message: str, role: str) -> dict:
     """Insert a single chat message into Table Storage."""
     now = datetime.now(timezone.utc)
-    # Use ISO timestamp as RowKey — ensures chronological sort
-    row_key = now.strftime("%Y%m%dT%H%M%S%f") + "Z"
+    # Monotonic RowKey: ISO timestamp + counter suffix — guarantees strict ordering
+    # even when two messages are saved within the same microsecond.
+    row_key = _next_row_key()
 
     entity = {
         "PartitionKey": user_id,

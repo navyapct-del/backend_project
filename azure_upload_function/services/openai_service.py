@@ -35,6 +35,12 @@ def _get_client() -> AzureOpenAI:
 def _deployment() -> str:
     return get_env("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4.1-mini")
 
+def _vision_deployment() -> str:
+    """Return the vision-capable deployment name.
+    Falls back to the standard deployment (gpt-4.1-mini / gpt-4o both support vision).
+    Override with AZURE_OPENAI_VISION_DEPLOYMENT to use a dedicated vision deployment."""
+    return get_env("AZURE_OPENAI_VISION_DEPLOYMENT", _deployment())
+
 _EMBED_MODEL = get_env("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-small")
 
 

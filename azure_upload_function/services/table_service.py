@@ -12,7 +12,7 @@ PARTITION_KEY = "documents"
 
 # Increment this when the structured_data schema changes.
 # Any stored record with a lower version will be auto-reprocessed.
-SCHEMA_VERSION = 10  # v10 = force re-embed all chunks with corrected OpenAI endpoint
+SCHEMA_VERSION = 3   # v3 = dynamic header detection + clean column names
 
 _table_client: TableClient | None = None
 
@@ -77,7 +77,6 @@ class TableService:
     # ------------------------------------------------------------------
 
     def update_ai_fields(self, filename: str, text: str, summary: str, tags: str,
-                         record_id: str = "",
                          structured_data: dict | None = None,
                          text_url: str = "",
                          structured_data_url: str = "") -> bool:
@@ -100,19 +99,11 @@ class TableService:
                             len(text_inline))
 
         try:
-            if record_id:
-                # Prefer direct RowKey lookup — avoids filename collision with deleted records
-                try:
-                    e = self._client.get_entity(partition_key=PARTITION_KEY, row_key=record_id)
-                    entities = [e]
-                except Exception:
-                    entities = []
-            else:
-                entities = list(self._client.query_entities(
-                    query_filter=f"PartitionKey eq '{PARTITION_KEY}' and filename eq '{filename}'"
-                ))
+            entities = list(self._client.query_entities(
+                query_filter=f"PartitionKey eq '{PARTITION_KEY}' and filename eq '{filename}'"
+            ))
             if not entities:
-                logging.warning("update_ai_fields: no entity for filename=%s record_id=%s", filename, record_id)
+                logging.warning("update_ai_fields: no entity for filename=%s", filename)
                 return False
 
             e     = entities[0]
@@ -157,34 +148,29 @@ class TableService:
             logging.exception("Table update failed for filename=%s", filename)
             raise
 
-    def get_structured_data(self, filename: str, uploaded_by: str = "") -> dict | None:
+    def get_structured_data(self, filename: str, session_id: str = "") -> dict | None:
         """
         Retrieve structured data — downloads from Blob Storage if URL exists,
         falls back to inline field. Returns None if stale or missing.
-        Only returns data from completed, non-temp documents.
+        When multiple entities share the same filename (e.g. temp uploads from
+        different sessions), prefer the one matching session_id, then the most recent.
         """
         try:
-            safe_fname = filename.replace("'", "''")
-            base_filter = (
-                f"PartitionKey eq '{PARTITION_KEY}' and filename eq '{safe_fname}'"
-                f" and status eq 'completed'"
-            )
-            if uploaded_by:
-                safe_owner = uploaded_by.replace("'", "''")
-                query_filter = base_filter + f" and uploaded_by eq '{safe_owner}'"
-            else:
-                query_filter = base_filter
-
-            entities = list(self._client.query_entities(query_filter=query_filter))
+            entities = list(self._client.query_entities(
+                query_filter=f"PartitionKey eq '{PARTITION_KEY}' and filename eq '{filename}'"
+            ))
             if not entities:
                 return None
 
-            # Pick the most recently processed entity (highest schema_version, then latest processed_at)
-            entities.sort(key=lambda x: (
-                int(x.get("schema_version", 0)),
-                x.get("processed_at", "") or ""
-            ), reverse=True)
-            e  = entities[0]
+            # Prefer entity matching session_id (temp uploads), then most recent
+            if session_id:
+                session_match = [e for e in entities if e.get("session_id", "") == session_id]
+                if session_match:
+                    entities = session_match
+
+            # Among remaining, pick most recent by created_at
+            entities.sort(key=lambda e: e.get("created_at", ""), reverse=True)
+            e = entities[0]
             sv = int(e.get("schema_version", 0))
             if sv < SCHEMA_VERSION:
                 logging.warning("get_structured_data: '%s' stale v%d < v%d", filename, sv, SCHEMA_VERSION)
@@ -235,12 +221,12 @@ class TableService:
 
     def get_stale_documents(self) -> list[dict]:
         """
-        Return all completed, non-temp documents whose schema_version < SCHEMA_VERSION.
+        Return all completed documents whose schema_version < SCHEMA_VERSION.
         Used by /reprocess endpoint to auto-update stale records.
         """
         try:
             entities = list(self._client.query_entities(
-                query_filter=f"PartitionKey eq '{PARTITION_KEY}' and status eq 'completed' and temp eq false"
+                query_filter=f"PartitionKey eq '{PARTITION_KEY}' and status eq 'completed'"
             ))
             stale = []
             for e in entities:
@@ -259,9 +245,55 @@ class TableService:
             logging.exception("get_stale_documents failed.")
             return []
 
-    # ------------------------------------------------------------------
-    # UPDATE EMBEDDING — called after update_ai_fields
-    # ------------------------------------------------------------------
+    def get_zero_text_pdfs(self) -> list[dict]:
+        """
+        Return completed documents (any type) that have no usable extracted text.
+        Covers both: no text_url set, and text_url pointing to an empty blob.
+        """
+        try:
+            entities = list(self._client.query_entities(
+                query_filter=f"PartitionKey eq '{PARTITION_KEY}' and status eq 'completed'"
+            ))
+            result = []
+            for e in entities:
+                fname = e.get("filename", "")
+                if not fname:
+                    continue
+                # Skip images — they legitimately have no text
+                if fname.lower().endswith((".jpg", ".jpeg", ".png", ".svg", ".gif", ".bmp", ".webp")):
+                    continue
+
+                inline_text = e.get("text", "")
+                text_url    = e.get("text_url", "")
+
+                # Has usable inline text — skip
+                if len(inline_text.strip()) >= 50:
+                    continue
+
+                # Has a text_url — check if the blob is non-empty
+                if text_url:
+                    try:
+                        from services.blob_service import BlobService
+                        text = BlobService().download_text(text_url)
+                        if len(text.strip()) >= 50:
+                            continue   # blob has real content — skip
+                    except Exception:
+                        pass  # blob missing/empty — fall through to reprocess
+
+                result.append({
+                    "PartitionKey": e["PartitionKey"],
+                    "RowKey":       e["RowKey"],
+                    "filename":     fname,
+                    "blob_url":     e.get("blob_url", ""),
+                    "uploaded_by":  e.get("uploaded_by", ""),
+                })
+            logging.info("get_zero_text_pdfs: %d documents with no usable text", len(result))
+            return result
+        except Exception:
+            logging.exception("get_zero_text_pdfs failed.")
+            return []
+
+
 
     def update_embedding(self, filename: str, embedding: list[float]) -> bool:
         """Store the embedding vector as a JSON string on the entity."""
@@ -501,7 +533,7 @@ class TableService:
             safe = uploaded_by.replace("'", "''")
             entities = list(self._client.query_entities(
                 query_filter=f"PartitionKey eq '{PARTITION_KEY}' and uploaded_by eq '{safe}'",
-                select=["RowKey", "filename", "summary", "tags", "blob_url", "status", "created_at", "uploaded_by", "temp"],
+                select=["RowKey", "filename", "summary", "tags", "blob_url", "status", "created_at", "uploaded_by"],
             ))
             docs = [{
                 "id":          e.get("RowKey", ""),
@@ -629,14 +661,3 @@ def get_user(email: str) -> dict | None:
                 "first_name": e.get("first_name", ""), "last_name": e.get("last_name", "")}
     except Exception:
         return None
-
-def update_user_password(email: str, new_password_hash: str) -> bool:
-    """Returns False if user does not exist."""
-    client = _get_users_client()
-    try:
-        entity = client.get_entity(partition_key="users", row_key=email)
-    except Exception:
-        return False
-    entity["password"] = new_password_hash
-    client.update_entity(entity, mode="merge")
-    return True

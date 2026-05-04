@@ -232,7 +232,6 @@ Rules:
 
 SELECT * PREVENTION (CRITICAL):
 - NEVER generate "select": [] or "select": ["*"] unless the query explicitly says "show everything" or "all columns"
-- NEVER use integer literals (e.g. 1, 2) in "select" or "group_by" — always use actual column names from the dataset
 - "list all X" → select ONLY the column that contains X values, e.g. select:["Name"], distinct:true
 - "show all X" → select ONLY the column that contains X values, NOT all columns
 - "list all names" → find the column whose name means "name" (e.g. "Name", "Student Name", "Full Name") and set select to ONLY that column
@@ -247,8 +246,7 @@ AGGREGATION INTENT DETECTION:
 - "total", "sum of", "sum" → SUM(column)
 - "average", "avg", "mean" → type:"avg" aggregation on the relevant column
 - "chart", "graph", "plot" + category column → groupby + COUNT(*) + chart
-- For "distribution by category" or "breakdown by X": group_by MUST use a LOW-CARDINALITY column (one that represents a category/type/status/department, NOT a name/ID/date). If unsure, pick the column whose name contains words like "category", "type", "status", "department", "group", "class", "level".
-- NEVER use integer literals (e.g. 1, 2) in "select" or "group_by" — always use actual column names from the dataset
+- NEVER use operator "=" with value null — always use "isnull" or "notnull"
 - Choose chart type using CHART TYPE SELECTION RULES above — do NOT default to bar for everything
 
 CATEGORICAL COMPARISON (A vs B, split by category):
@@ -416,10 +414,7 @@ def _validate_plan(plan: dict, columns: list[str]) -> None:
 
     col_set = {c.lower() for c in columns}
 
-    def _valid(col) -> bool:
-        # Reject non-string values (e.g. integer literals like 1)
-        if not isinstance(col, str):
-            return False
+    def _valid(col: str) -> bool:
         return col == "*" or col.lower() in col_set
 
     # Capture original non-wildcard select before sanitization
@@ -597,38 +592,10 @@ def execute_plan(df: pd.DataFrame, plan: dict) -> dict:
         operation = plan.get("operation", "select")
 
         if group_cols and aggs:
-            # Cardinality guard: reject groupby on high-cardinality columns (e.g. names, IDs)
-            for gc in group_cols:
-                n_unique = result_df[gc].nunique()
-                n_rows   = len(result_df)
-                if n_unique > 30 and n_unique > n_rows * 0.5:
-                    logging.warning(
-                        "execute_plan: groupby column '%s' has %d unique values (%d rows) — likely wrong column, rejecting plan",
-                        gc, n_unique, n_rows
-                    )
-                    return {
-                        "type":    "error",
-                        "answer":  f"Column '{gc}' has too many unique values ({n_unique}) to group by meaningfully. Please specify a categorical column.",
-                        "columns": [], "rows": [], "chart_config": None, "script": "",
-                    }
             result_df = _apply_groupby(result_df, group_cols, aggs)
             resp_type = "table"
 
         elif group_cols and not aggs:
-            # groupby with no explicit aggregation → count rows per group
-            for gc in group_cols:
-                n_unique = result_df[gc].nunique()
-                n_rows   = len(result_df)
-                if n_unique > 30 and n_unique > n_rows * 0.5:
-                    logging.warning(
-                        "execute_plan: groupby column '%s' has %d unique values — likely wrong column, rejecting plan",
-                        gc, n_unique
-                    )
-                    return {
-                        "type":    "error",
-                        "answer":  f"Column '{gc}' has too many unique values ({n_unique}) to group by meaningfully. Please specify a categorical column.",
-                        "columns": [], "rows": [], "chart_config": None, "script": "",
-                    }
             # groupby with no explicit aggregation → count rows per group
             result_df = (
                 result_df.groupby(group_cols, as_index=False)
@@ -711,8 +678,11 @@ def execute_plan(df: pd.DataFrame, plan: dict) -> dict:
                 )
 
         # ── 5. Apply limit ────────────────────────────────────────────────
+        # Never truncate when the result feeds a chart or aggregation —
+        # doing so produces partial/incorrect distributions and wrong totals.
         limit = plan.get("limit")
-        if limit:
+        is_agg_or_chart = bool(group_cols or aggs or plan.get("chart"))
+        if limit and not is_agg_or_chart:
             result_df = result_df.head(int(limit))
 
         # ── 6. Clean NaN / non-serialisable values ────────────────────────
@@ -973,6 +943,9 @@ def _apply_groupby(df: pd.DataFrame, group_cols: list[str], aggs: list[dict]) ->
         for a in col_aggs:
             col   = _resolve_col(df, a.get("column", "")) or df.columns[0]
             atype = _pandas_agg(a.get("type", "count"))   # avg → mean
+            # Coerce to numeric if needed (values may be stored as strings in JSON)
+            if atype in ("mean", "sum", "min", "max", "std") and df[col].dtype == object:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
             agg_dict.setdefault(col, []).append(atype)
 
         result = base.agg(agg_dict)
@@ -1531,51 +1504,41 @@ def get_series_from_data(data: list[dict], x_key: str = "") -> list[str]:
 
 def structured_to_df(structured: dict) -> pd.DataFrame:
     """
-    Convert stored structured_data into a single flat DataFrame.
-    For multi-sheet Excel: concatenates all sheets. Only deduplicates when
-    there are multiple sheets (removes rows that appear identically in >1 sheet).
-    Single-sheet files are returned as-is — no deduplication.
+    Convert stored structured_data (with optional 'sheets' key) into a
+    single flat DataFrame. Adds a '_sheet' column when merging multiple sheets.
+    Numeric columns stored as strings are coerced to numeric dtype.
     """
     if not structured:
         return pd.DataFrame()
 
+    def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
+        for col in df.columns:
+            if col.startswith("_"):
+                continue
+            converted = pd.to_numeric(df[col], errors="coerce")
+            # Only replace if at least half the non-null values converted successfully
+            if converted.notna().sum() >= df[col].notna().sum() * 0.5:
+                df[col] = converted
+        return df
+
     sheets = structured.get("sheets", {})
     if sheets:
         frames = []
-        for sd in sheets.values():
+        for sname, sd in sheets.items():
             df_s = pd.DataFrame(sd.get("rows", []))
             if not df_s.empty:
-                frames.append(df_s)
-        if not frames:
-            return pd.DataFrame()
-        df = pd.concat(frames, ignore_index=True)
-        # Only dedup when multiple sheets — single sheet data is trusted as-is
-        if len(frames) > 1:
-            before = len(df)
-            df_filled = df.fillna("__NA__")
-            df = df[~df_filled.duplicated()].reset_index(drop=True)
-            logging.info("structured_to_df: %d sheets → %d rows (%d cross-sheet dupes removed)",
-                         len(frames), len(df), before - len(df))
-        return _infer_numeric(df)
+                df_s["_sheet"] = sname
+                frames.append(_coerce_numeric(df_s))
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     rows = structured.get("rows", [])
     if rows:
-        df = pd.DataFrame(rows).drop(columns=["_sheet"], errors="ignore")
-        return _infer_numeric(df)
+        return _coerce_numeric(pd.DataFrame(rows))
 
     if isinstance(structured, list):
-        return _infer_numeric(pd.DataFrame(structured))
+        return _coerce_numeric(pd.DataFrame(structured))
 
     return pd.DataFrame()
-
-
-def _infer_numeric(df: pd.DataFrame) -> pd.DataFrame:
-    """Try to convert string columns to numeric where possible."""
-    for col in df.columns:
-        converted = pd.to_numeric(df[col], errors="coerce")
-        if converted.notna().sum() > len(df) * 0.5:  # majority are numeric
-            df[col] = converted
-    return df
 
 
 # ---------------------------------------------------------------------------

@@ -337,7 +337,9 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
         t0   = time.time()
         try:
             text, structured_data = extract_with_structured(file_bytes, filename)
-        except Exception as extraction_err:
+        except RuntimeError as extraction_err:
+            # Images with no detectable text raise RuntimeError("too little text").
+            # Fall back to filename-based text so the upload can still complete.
             logging.warning("Extraction warning for '%s': %s — using filename fallback", filename, extraction_err)
             text            = filename
             structured_data = None
@@ -418,8 +420,7 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
 
         table_svc.update_ai_fields(
             filename, text, summary, tags_str,
-            record_id           = record_id,
-            structured_data     = structured_data if not sd_url else None,
+            structured_data     = structured_data if not sd_url else None,  # inline only if no URL
             text_url            = text_url,
             structured_data_url = sd_url,
         )
@@ -503,20 +504,39 @@ def reprocess(req: func.HttpRequest) -> func.HttpResponse:
     """
     Finds all documents with outdated schema_version and reprocesses them
     by re-downloading from Blob Storage and re-extracting structured data.
+    Also reprocesses completed PDFs that have no extracted text (text_chars=0).
 
     Call this after any backend logic change that affects structured_data format.
     No manual re-upload required.
     """
     logging.info("POST /reprocess")
     try:
-        from services.table_service import SCHEMA_VERSION
-        from services.extractor     import extract_with_structured
-        from azure.storage.blob     import BlobServiceClient
+        from services.table_service  import SCHEMA_VERSION
+        from services.extractor      import extract_with_structured
+        from services.search_service import get_indexed_doc_ids
+        from azure.storage.blob      import BlobServiceClient
 
-        table_svc = TableService()
-        stale     = table_svc.get_stale_documents()
+        table_svc   = TableService()
+        stale       = table_svc.get_stale_documents()
+        zero_text   = table_svc.get_zero_text_pdfs()
+        indexed_ids = get_indexed_doc_ids()
 
-        if not stale:
+        # All completed docs not in the search index at all
+        all_docs = table_svc.list_documents()
+        unindexed = [
+            {"RowKey": d["id"], "filename": d["filename"],
+             "blob_url": d["blob_url"], "uploaded_by": d.get("uploaded_by", "")}
+            for d in all_docs
+            if d.get("status") == "completed" and d["id"] not in indexed_ids
+        ]
+
+        # Deduplicate across all three lists
+        stale_keys    = {d["RowKey"] for d in stale}
+        zero_keys     = {d["RowKey"] for d in zero_text}
+        extra_docs    = [d for d in zero_text   if d["RowKey"] not in stale_keys]
+        extra_docs   += [d for d in unindexed   if d["RowKey"] not in stale_keys and d["RowKey"] not in zero_keys]
+
+        if not stale and not extra_docs:
             return func.HttpResponse(
                 json.dumps({"message": f"All documents are up to date (v{SCHEMA_VERSION}).",
                             "updated": 0}),
@@ -528,77 +548,76 @@ def reprocess(req: func.HttpRequest) -> func.HttpResponse:
         updated = 0
         failed  = []
 
-        for doc in stale:
+        def _reprocess_doc(doc: dict, reindex: bool) -> None:
+            nonlocal updated
             filename = doc["filename"]
             blob_url = doc["blob_url"]
-            try:
-                # Download file bytes from Blob Storage using the SDK's URL parser
-                # (avoids fragile split("/") which breaks on blob names containing "/")
-                from azure.storage.blob import BlobClient
-                blob_client = BlobClient.from_blob_url(
-                    blob_url   = blob_url,
-                    credential = blob_svc_c.credential,
-                )
-                file_bytes  = blob_client.download_blob().readall()
+            from azure.storage.blob import BlobClient
+            blob_client = BlobClient.from_blob_url(
+                blob_url   = blob_url,
+                credential = blob_svc_c.credential,
+            )
+            file_bytes = blob_client.download_blob().readall()
 
-                # Re-extract with current logic
-                text, structured_data = extract_with_structured(file_bytes, filename)
+            text, structured_data = extract_with_structured(file_bytes, filename)
 
-                # Upload new structured data to Blob (replaces old blob)
-                sd_url = ""
-                if structured_data:
-                    try:
-                        from services.blob_service import BlobService as _BlobSvc
-                        sd_url = _BlobSvc().upload_structured_data(doc["RowKey"], structured_data)
-                    except Exception as blob_exc:
-                        logging.warning("Reprocess: blob upload failed for %s: %s", filename, blob_exc)
+            blob_svc_local = BlobService()
+            text_url = blob_svc_local.upload_text(doc["RowKey"], text)
+            sd_url   = ""
+            if structured_data:
+                sd_url = blob_svc_local.upload_structured_data(doc["RowKey"], structured_data)
 
-                # Update Table Storage with new schema
-                table_svc.update_ai_fields(
-                    filename, text,
-                    summary             = "",
-                    tags                = "",
-                    record_id           = doc["RowKey"],
-                    structured_data     = structured_data if not sd_url else None,
-                    structured_data_url = sd_url,
-                )
+            table_svc.update_ai_fields(
+                filename, text,
+                summary             = "",
+                tags                = "",
+                structured_data     = structured_data if not sd_url else None,
+                text_url            = text_url,
+                structured_data_url = sd_url,
+            )
 
-                # Re-index chunks in Azure AI Search (replaces old chunks for this doc)
-                try:
-                    from services.chunking_service import chunk_text
-                    from services.search_service   import index_document, ensure_index
-                    from services.table_service    import store_chunk_embedding
-                    ensure_index()
-                    chunks = chunk_text(text, doc["RowKey"], filename)
-                    if not chunks:
-                        chunks = [{"chunk_id": doc["RowKey"], "doc_id": doc["RowKey"],
-                                   "filename": filename, "chunk_index": 0, "text": text[:32000]}]
-                    for chunk in chunks:
-                        chunk_emb = generate_embedding(chunk["text"])
-                        index_document(
-                            doc_id      = doc["RowKey"],
-                            filename    = filename,
-                            content     = chunk["text"],
-                            summary     = "",
-                            tags        = [],
-                            blob_url    = blob_url,
-                            embedding   = chunk_emb,
-                            chunk_index = chunk["chunk_index"],
-                            chunk_id    = chunk["chunk_id"],
-                            uploaded_by = doc.get("uploaded_by", ""),
-                        )
-                        if chunk_emb:
-                            store_chunk_embedding(chunk["chunk_id"], doc["RowKey"], chunk_emb)
-                    logging.info("Re-indexed %d chunks for %s", len(chunks), filename)
-                except Exception as idx_exc:
-                    logging.warning("Reprocess: chunk re-index failed for %s: %s", filename, idx_exc)
-
+            if reindex:
+                from services.chunking_service import chunk_text
+                from services.table_service    import store_chunk_embedding
+                ensure_index()
+                chunks = chunk_text(text, doc["RowKey"], filename)
+                if not chunks:
+                    chunks = [{"chunk_id": doc["RowKey"], "doc_id": doc["RowKey"],
+                               "filename": filename, "chunk_index": 0, "text": text[:32000]}]
+                for chunk in chunks:
+                    chunk_emb = generate_embedding(chunk["text"])
+                    index_document(
+                        doc_id      = doc["RowKey"],
+                        filename    = filename,
+                        content     = chunk["text"],
+                        summary     = "",
+                        tags        = [],
+                        blob_url    = blob_url,
+                        embedding   = chunk_emb,
+                        chunk_index = chunk["chunk_index"],
+                        chunk_id    = chunk["chunk_id"],
+                        uploaded_by = doc.get("uploaded_by", ""),
+                    )
+                    if chunk_emb:
+                        store_chunk_embedding(chunk["chunk_id"], doc["RowKey"], chunk_emb)
+                logging.info("Reprocessed+reindexed zero-text PDF: %s (%d chars)", filename, len(text))
+            else:
                 logging.info("Reprocessed: %s → v%d", filename, SCHEMA_VERSION)
-                updated += 1
+            updated += 1
 
+        for doc in stale:
+            try:
+                _reprocess_doc(doc, reindex=False)
             except Exception as exc:
-                logging.exception("Reprocess failed for %s", filename)
-                failed.append({"filename": filename, "error": str(exc)})
+                logging.exception("Reprocess failed for %s", doc["filename"])
+                failed.append({"filename": doc["filename"], "error": str(exc)})
+
+        for doc in extra_docs:
+            try:
+                _reprocess_doc(doc, reindex=True)
+            except Exception as exc:
+                logging.exception("Reprocess (unindexed doc) failed for %s", doc["filename"])
+                failed.append({"filename": doc["filename"], "error": str(exc)})
 
         return func.HttpResponse(
             json.dumps({
@@ -715,40 +734,6 @@ def login(req: func.HttpRequest) -> func.HttpResponse:
                                  status_code=500, mimetype="application/json")
 
 
-# ---------------------------------------------------------------------------
-# POST /forgot-password  { email, new_password }
-# ---------------------------------------------------------------------------
-
-@app.route(route="forgot-password", methods=["POST"])
-def forgot_password(req: func.HttpRequest) -> func.HttpResponse:
-    try:
-        body         = req.get_json()
-        email        = (body.get("email") or "").strip().lower()
-        new_password = body.get("new_password") or ""
-        if not email or not new_password:
-            return func.HttpResponse(json.dumps({"error": "email and new_password required"}),
-                                     status_code=400, mimetype="application/json")
-        import re, bcrypt
-        if (len(new_password) < 8 or not re.search(r'[A-Z]', new_password) or
-            not re.search(r'[a-z]', new_password) or not re.search(r'[0-9]', new_password) or
-            not re.search(r'[!@#$%^&*(),.?":{}|<>]', new_password)):
-            return func.HttpResponse(
-                json.dumps({"error": "Password must be 8+ chars with uppercase, lowercase, number and special character"}),
-                status_code=400, mimetype="application/json")
-        from services.table_service import get_user, update_user_password
-        if not get_user(email):
-            return func.HttpResponse(json.dumps({"error": "No account found with that email"}),
-                                     status_code=404, mimetype="application/json")
-        pw_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
-        update_user_password(email, pw_hash)
-        return func.HttpResponse(json.dumps({"message": "Password updated"}),
-                                 status_code=200, mimetype="application/json")
-    except Exception:
-        logging.exception("/forgot-password error")
-        return func.HttpResponse(json.dumps({"error": "Password reset failed"}),
-                                 status_code=500, mimetype="application/json")
-
-
 # GET /documents — list from Table Storage (lightweight, for UI polling)
 # ---------------------------------------------------------------------------
 
@@ -770,74 +755,6 @@ def documents(req: func.HttpRequest) -> func.HttpResponse:
 # ---------------------------------------------------------------------------
 # GET /diagnose — raw Table Storage state for debugging
 # ---------------------------------------------------------------------------
-
-@app.route(route="test-extract", methods=["GET"])
-def test_extract(req: func.HttpRequest) -> func.HttpResponse:
-    """Diagnostic: test full extraction on the first xlsx in storage."""
-    import traceback
-    try:
-        from services.blob_service import BlobService
-        from services.extractor import extract_with_structured
-        from azure.storage.blob import BlobServiceClient
-        conn_str = require_env("AZURE_STORAGE_CONNECTION_STRING")
-        bsc = BlobServiceClient.from_connection_string(conn_str)
-        cc = bsc.get_container_client("documents")
-        blobs = [b for b in cc.list_blobs() if b.name.endswith('.xlsx') and not b.name.startswith('temp/')]
-        if not blobs:
-            blobs = [b for b in cc.list_blobs() if b.name.endswith('.xlsx')]
-        if not blobs:
-            return func.HttpResponse(json.dumps({"error": "no xlsx found"}), status_code=404, mimetype="application/json")
-        blob = blobs[0]
-        data = cc.get_blob_client(blob.name).download_blob().readall()
-        text, sd = extract_with_structured(data, blob.name)
-        result = {
-            "blob": blob.name,
-            "text_len": len(text),
-            "structured": sd is not None,
-            "sheets": list(sd.get("sheets", {}).keys()) if sd else [],
-            "row_count": sum(len(v.get("rows",[])) for v in sd.get("sheets",{}).values()) if sd else 0,
-        }
-        return func.HttpResponse(json.dumps(result), status_code=200, mimetype="application/json")
-    except Exception as exc:
-        return func.HttpResponse(json.dumps({"error": str(exc), "trace": traceback.format_exc()[-800:]}), status_code=500, mimetype="application/json")
-
-
-@app.route(route="test-upload", methods=["GET"])
-def test_upload(req: func.HttpRequest) -> func.HttpResponse:
-    """Diagnostic: test structured data blob upload."""
-    import traceback
-    try:
-        from services.blob_service import BlobService
-        bs = BlobService()
-        test_data = {"columns": ["Name", "Salary"], "rows": [{"Name": "Test", "Salary": "100"}] * 1000}
-        url = bs.upload_structured_data("test-diag-id", test_data)
-        # Clean up
-        try:
-            bs._client.get_blob_client("metadata", "test-diag-id/structured_data.json").delete_blob()
-        except Exception:
-            pass
-        return func.HttpResponse(json.dumps({"ok": True, "url": url}), status_code=200, mimetype="application/json")
-    except Exception as exc:
-        return func.HttpResponse(json.dumps({"ok": False, "error": str(exc), "trace": traceback.format_exc()[-500:]}), status_code=500, mimetype="application/json")
-
-
-@app.route(route="test-embed", methods=["GET"])
-def test_embed(req: func.HttpRequest) -> func.HttpResponse:
-    """Diagnostic: test embedding generation and return result."""
-    import os
-    try:
-        from services.openai_service import generate_embedding
-        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "NOT SET")
-        vec = generate_embedding("hello world test")
-        return func.HttpResponse(
-            json.dumps({"endpoint": endpoint, "embedding_len": len(vec), "ok": len(vec) > 0}),
-            status_code=200, mimetype="application/json")
-    except Exception as exc:
-        import os
-        return func.HttpResponse(
-            json.dumps({"error": str(exc), "endpoint": os.getenv("AZURE_OPENAI_ENDPOINT", "NOT SET")}),
-            status_code=500, mimetype="application/json")
-
 
 @app.route(route="diagnose", methods=["GET"])
 def diagnose(req: func.HttpRequest) -> func.HttpResponse:
@@ -938,13 +855,11 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
             # Structured engine chart (has chart_config + data rows)
             if chart_config and rows:
                 x_key     = chart_config.get("xKey", "")
-                _single_series_types = {"pie", "donut", "radar", "funnel", "treemap"}
-                if chart_config.get("type") not in _single_series_types:
-                    axis_info = detect_dual_axis_from_rows(rows, x_key)
-                    chart_config["series"]   = axis_info["series"]
-                    chart_config["dualAxis"] = axis_info["dual_axis"]
-                    if axis_info["dual_axis"]:
-                        chart_config["type"] = axis_info.get("chart_type", "composed")
+                axis_info = detect_dual_axis_from_rows(rows, x_key)
+                chart_config["series"]   = axis_info["series"]
+                chart_config["dualAxis"] = axis_info["dual_axis"]
+                if axis_info["dual_axis"]:
+                    chart_config["type"] = axis_info.get("chart_type", "composed")
                 return func.HttpResponse(
                     _safe_json({
                         "type":         "chart",
@@ -1053,7 +968,7 @@ def download_document(req: func.HttpRequest) -> func.HttpResponse:
                 status_code=404, mimetype="application/json")
 
         # Generate SAS URL (valid for 1 hour)
-        sas_url = BlobService().generate_sas_url(blob_url, expiry_hours=8)
+        sas_url = BlobService().generate_sas_url(blob_url, expiry_hours=1)
 
         return func.HttpResponse(
             json.dumps({"sas_url": sas_url, "filename": filename}),
@@ -1183,14 +1098,12 @@ def serve_file(req: func.HttpRequest) -> func.HttpResponse:
             "doc": "application/msword",
         }
         content_type = mime_map.get(ext, "application/octet-stream")
-        inline_types = {"text/plain", "text/csv", "image/jpeg", "image/png", "image/gif", "image/webp", "image/svg+xml", "application/pdf"}
-        disposition  = "inline" if content_type in inline_types else f'attachment; filename="{filename}"'
 
         return func.HttpResponse(
             body=data,
             status_code=200,
             mimetype=content_type,
-            headers={"Content-Disposition": disposition},
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
     except Exception as exc:
         logging.exception("serve_file error.")
@@ -1382,7 +1295,7 @@ def agent_query(req: func.HttpRequest) -> func.HttpResponse:
                 response = {"type": "text", "data": answer, "source": "upload", "intent": intent}
 
         elif intent == "document_qa":
-            rag_result = run_rag_pipeline(query=q, top_k=7, use_hyde=True, use_compression=True)
+            rag_result = run_rag_pipeline(query=q, session_id=session_id, top_k=7, use_hyde=True, use_compression=True)
             response = {"type": rag_result.get("type", "text"), "data": rag_result, "source": "knowledge", "intent": intent}
 
         else:  # general_qa or followup
@@ -1417,7 +1330,7 @@ def agent_query(req: func.HttpRequest) -> func.HttpResponse:
                 if intent == "followup" and context:
                     last_turn = context[-1]
                     resolved_q = f"{last_turn.get('query', '')} {q}"
-                rag_result = run_rag_pipeline(query=resolved_q, top_k=5, use_hyde=True, use_compression=True)
+                rag_result = run_rag_pipeline(query=resolved_q, session_id=session_id, top_k=5, use_hyde=True, use_compression=True)
                 rag_answer = rag_result.get("answer", "") or ""
             except Exception as rag_exc:
                 logging.warning("agent_query: RAG failed: %s", rag_exc)
@@ -1588,7 +1501,7 @@ def agent_ask(req: func.HttpRequest) -> func.HttpResponse:
 
     try:
         from services.rag_pipeline import run_rag_pipeline
-        rag_result = run_rag_pipeline(query=q, top_k=7, use_hyde=True, use_compression=True)
+        rag_result = run_rag_pipeline(query=q, session_id=session_id, top_k=7, use_hyde=True, use_compression=True)
         response = {"type": rag_result.get("type", "text"), "data": rag_result, "source": "knowledge", "session_id": session_id, "intent": "general_qa"}
         return func.HttpResponse(_safe_json(response), status_code=200, mimetype="application/json")
     except Exception as exc:

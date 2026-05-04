@@ -469,25 +469,13 @@ def _clean_chart_data(chart: dict, user_query: str = "") -> dict:
     labels  = labels[:min_len]
     values  = values[:min_len]
 
-    # Convert values to numbers — also evaluate arithmetic expressions like "110042+71383"
-    def _to_float(v) -> float:
-        if v is None:
-            return 0.0
+    # Convert values to numbers, replace None with 0
+    clean_values = []
+    for v in values:
         try:
-            return float(v)
+            clean_values.append(float(v) if v is not None else 0.0)
         except (TypeError, ValueError):
-            pass
-        # Evaluate safe arithmetic expressions (only digits, spaces, +, -, *, /, .)
-        s = str(v).strip()
-        import re as _re
-        if _re.fullmatch(r"[\d\s\+\-\*\/\.]+", s):
-            try:
-                return float(eval(s))  # nosec — input validated to digits+operators only
-            except Exception:
-                pass
-        return 0.0
-
-    clean_values = [_to_float(v) for v in values]
+            clean_values.append(0.0)
 
     if chart_type == "pie":
         # Filter out zero/negative slices
@@ -612,6 +600,7 @@ def run_rag_pipeline(
     query:           str,
     filename_filter: str = "",
     uploaded_by:     str = "",
+    session_id:      str = "",
     top_k:           int = 7,
     use_hyde:        bool = True,
     use_compression: bool = True,
@@ -621,30 +610,22 @@ def run_rag_pipeline(
 
     Pipeline:
       1. Multi-query retrieval with HyDE
-      2. Structured data lookup (full-file, not chunk-limited)
-      3. Intent classification
-      4. Structured engine (for tabular/chart queries) OR prose RAG
-      5. Contextual compression + grounded generation (prose path)
+      2. Contextual compression
+      3. Grounded generation with strict system prompt
+      4. Response formatting
 
-    Returns a response dict with type, answer, and optional table/chart data.
+    Returns a response dict with type, answer, sources, and optional
+    table/chart data.
     """
     from services.table_service import TableService
-    import time as _time
 
     if not query or not query.strip():
         return {"type": "text", "answer": "No question provided."}
 
-    q_lower = query.lower()
-
-    # ── FIX #2: Boost top_k for structured/chart queries ─────────────────
-    # Chart and aggregation queries need more chunks to cover all categories.
-    is_chart_or_agg = any(k in q_lower for k in _CHART_KEYWORDS | _STRUCTURED_KEYWORDS)
-    effective_top_k = 15 if is_chart_or_agg else top_k
-
     # ── Step 1: Multi-query retrieval with HyDE ───────────────────────────
     chunks = multi_query_retrieve(
         query           = query,
-        top_k           = effective_top_k,
+        top_k           = top_k,
         filename_filter = filename_filter,
         uploaded_by     = uploaded_by,
         use_hyde        = use_hyde,
@@ -656,8 +637,90 @@ def run_rag_pipeline(
             "answer": "No relevant information found in this document.",
         }
 
-    # ── FIX #3: Cache key includes uploaded_by (already correct) ─────────
-    cache_key = hashlib.md5((query + "|" + filename_filter + "|" + uploaded_by).encode()).hexdigest()
+    # ── Step 2: Build cache key (includes session_id to isolate per-session results) ──
+    import time as _time
+    cache_key = hashlib.md5((query + "|" + filename_filter + "|" + uploaded_by + "|" + session_id).encode()).hexdigest()
+
+    # ── Step 3: Check for structured data (for analytical queries) ────────
+    # CRITICAL: match structured data to the query topic, not just "first with data"
+    table_svc = TableService()
+    stored_sd = None
+
+    q_lower   = query.lower()
+    q_words   = set(w.strip(".,!?;:()") for w in q_lower.split() if len(w) >= 3)
+
+    def _sd_relevance_score(sd: dict, filename: str) -> int:
+        """Score how relevant a document's structured data is to the query."""
+        score = 0
+        # Column name overlap with query words (stemmed: strip trailing s/es/ing)
+        sd_columns = sd.get("columns", [])
+        if not sd_columns and sd.get("sheets"):
+            for sheet_data in sd["sheets"].values():
+                sd_columns = sheet_data.get("columns", [])
+                if sd_columns:
+                    break
+
+        def _stem(w: str) -> str:
+            """Minimal suffix stripping for English plurals/gerunds."""
+            if w.endswith("ing") and len(w) > 5:
+                return w[:-3]
+            if w.endswith("ies") and len(w) > 4:
+                return w[:-3] + "y"
+            if w.endswith("es") and len(w) > 4:
+                return w[:-2]
+            if w.endswith("s") and len(w) > 3:
+                return w[:-1]
+            return w
+
+        stemmed_q_words = {_stem(w) for w in q_words} | q_words
+
+        for col in sd_columns:
+            col_lower = col.lower().replace("_", " ").replace("-", " ")
+            col_words = set(col_lower.split())
+            stemmed_col_words = {_stem(w) for w in col_words} | col_words
+            for qw in stemmed_q_words:
+                # Substring match (stemmed)
+                if qw in col_lower or any(qw in cw or cw in qw for cw in stemmed_col_words):
+                    score += 3
+                    break
+        # Filename overlap with query words (stemmed)
+        fname_lower = filename.lower().replace("_", " ").replace("-", " ")
+        for qw in stemmed_q_words:
+            if qw in fname_lower:
+                score += 5
+                break
+        # Chart/aggregation keywords get a base score only if structured data has numeric columns
+        chart_agg_kw = {"chart", "graph", "plot", "total", "sum", "average",
+                        "count", "max", "min", "distribution", "breakdown"}
+        numeric_cols = [c for c in sd_columns if any(
+            isinstance(v, (int, float)) for v in [] # checked at query time
+        )]
+        if any(k in q_lower for k in chart_agg_kw) and sd_columns:
+            score += 1
+        return score
+
+    # Score all retrieved documents' structured data and pick the best match
+    best_score = -1
+    for chunk in chunks:
+        fname = chunk.get("filename", "")
+        if not fname:
+            continue
+        sd = table_svc.get_structured_data(fname, session_id=session_id)
+        if not sd:
+            continue
+        score = _sd_relevance_score(sd, fname)
+        logging.info("run_rag_pipeline: structured data relevance '%s' score=%d", fname, score)
+        if score > best_score:
+            best_score = score
+            stored_sd  = sd
+            logging.info("run_rag_pipeline: selected structured data from '%s' (score=%d)", fname, score)
+
+    # Only use structured data if it has meaningful relevance to the query
+    if best_score <= 0:
+        stored_sd = None
+        logging.info("run_rag_pipeline: no relevant structured data found — using prose RAG")
+
+    # ── Step 4b: Check cache (after structured data selection so key is stable) ──
     cached = _pipeline_cache.get(cache_key)
     if cached:
         result, ts = cached
@@ -665,213 +728,64 @@ def run_rag_pipeline(
             logging.info("run_rag_pipeline: cache hit")
             return result
         else:
-            del _pipeline_cache[cache_key]
+            del _pipeline_cache[cache_key]  # expired
 
-    # ── FIX #1 + #4: Structured data lookup — full-file, not chunk-limited ─
-    # When filename_filter is set: fetch directly (exact match, no scoring).
-    # When no filter: scan ALL user's documents for the best column-overlap match.
-    # This ensures InformationSage and SingleFileSathi use the same data source.
-    table_svc = TableService()
-    stored_sd = None
-    best_score = -1
-
-    def _stem(w: str) -> str:
-        if w.endswith("ing") and len(w) > 5: return w[:-3]
-        if w.endswith("ies") and len(w) > 4: return w[:-3] + "y"
-        if w.endswith("es")  and len(w) > 4: return w[:-2]
-        if w.endswith("s")   and len(w) > 3: return w[:-1]
-        return w
-
-    q_words        = set(w.strip(".,!?;:()") for w in q_lower.split() if len(w) >= 3)
-    stemmed_q      = {_stem(w) for w in q_words} | q_words
-
-    def _sd_score(sd: dict, filename: str) -> int:
-        """Column-overlap + filename-overlap score for structured data relevance."""
-        score = 0
-        sd_columns = sd.get("columns", [])
-        if not sd_columns and sd.get("sheets"):
-            for sheet_data in sd["sheets"].values():
-                sd_columns = sheet_data.get("columns", [])
-                if sd_columns:
-                    break
-        for col in sd_columns:
-            col_norm = col.lower().replace("_", " ").replace("-", " ")
-            col_stemmed = {_stem(w) for w in col_norm.split()} | set(col_norm.split())
-            for qw in stemmed_q:
-                if qw in col_norm or any(qw in cw or cw in qw for cw in col_stemmed):
-                    score += 3
-                    break
-        fname_norm = filename.lower().replace("_", " ").replace("-", " ")
-        for qw in stemmed_q:
-            if qw in fname_norm:
-                score += 5
-                break
-        # Any chart/agg keyword + has columns → base relevance
-        if any(k in q_lower for k in _CHART_KEYWORDS | {"total","sum","average","count","distribution","breakdown"}) and sd_columns:
-            score += 1
-        return score
-
-    if filename_filter:
-        # Exact file requested — use it directly
-        stored_sd  = table_svc.get_structured_data(filename_filter, uploaded_by=uploaded_by)
-        best_score = 1 if stored_sd else -1
-        if stored_sd:
-            logging.info("run_rag_pipeline: structured data from filename_filter='%s'", filename_filter)
-    else:
-        # Scan ALL user documents for best match.
-        # Composite score = column overlap + retrieval score (tiebreaker when query is generic).
-        candidate_filenames: set[str] = set()
-
-        # Build retrieval score map: filename → best chunk score from vector search
-        chunk_score_map: dict[str, float] = {}
-        for chunk in chunks:
-            fname = chunk.get("filename", "")
-            if fname:
-                candidate_filenames.add(fname)
-                chunk_score_map[fname] = max(chunk_score_map.get(fname, 0.0), chunk.get("score", 0.0))
-
-        # Also scan all user's documents for chart/agg queries
-        if is_chart_or_agg:
-            try:
-                if uploaded_by:
-                    all_docs = table_svc.list_documents_by_user(uploaded_by)
-                else:
-                    # No user identity — scan all documents (single-tenant / dev mode)
-                    all_docs = table_svc.list_documents()
-                for doc in all_docs:
-                    if doc.get("filename"):
-                        candidate_filenames.add(doc["filename"])
-            except Exception as exc:
-                logging.warning("run_rag_pipeline: list_documents failed: %s", exc)
-
-        best_composite = -1.0
-        for fname in candidate_filenames:
-            sd = table_svc.get_structured_data(fname, uploaded_by=uploaded_by)
-            if not sd:
-                continue
-            col_score    = _sd_score(sd, fname)
-            # Composite = column overlap + retrieval score weighted 2x as tiebreaker
-            retrieval_sc = chunk_score_map.get(fname, 0.0)
-            composite    = col_score + retrieval_sc * 2.0
-            logging.info("run_rag_pipeline: sd '%s' col_score=%d retrieval=%.3f composite=%.3f",
-                         fname, col_score, retrieval_sc, composite)
-            if composite > best_composite:
-                best_composite = composite
-                best_score     = col_score
-                stored_sd      = sd
-                logging.info("run_rag_pipeline: selected sd from '%s' (composite=%.3f)", fname, composite)
-
-    # Accept any structured data with a positive signal (col overlap OR retrieval hit)
-    if best_score < 0:
-        stored_sd = None
-        logging.info("run_rag_pipeline: no relevant structured data — using prose RAG")
-
-    # ── Step 3: Intent classification ────────────────────────────────────
+    # ── Step 5: Intent classification ────────────────────────────────────
     intent = classify_intent(query, has_structured_data=stored_sd is not None)
     logging.info("run_rag_pipeline: intent=%s has_sd=%s", intent, stored_sd is not None)
 
-    # ── FIX #5: Structured engine path — never fall through to prose RAG for charts ─
-    # Prose RAG invents chart data from text; structured engine uses real row data.
+    # ── Step 6: Route to structured engine or prose RAG ──────────────────
     if intent == "structured" and stored_sd:
-        from services.query_engine import generate_plan, execute_plan, structured_to_df, promote_to_chart
+        from services.query_engine import generate_plan, execute_plan, structured_to_df
+        import pandas as pd
+        import json as _json
 
-        def _run_engine(q: str, sd: dict) -> dict | None:
+        def _run_engine_local(query: str, structured: dict) -> dict | None:
             try:
-                df = structured_to_df(sd)
+                df = structured_to_df(structured)
                 if df.empty:
                     return None
-                df   = df.drop(columns=[c for c in df.columns if c.startswith("_")], errors="ignore")
-                plan = generate_plan(q, list(df.columns))
-                return execute_plan(df, plan)
-            except Exception as exc:
-                logging.warning("_run_engine failed: %s", exc)
-                return None
-
-        def _run_engine_fallback(q: str, sd: dict) -> dict | None:
-            """
-            Fallback: auto-detect the best categorical column and run COUNT(*) GROUP BY.
-            Filters out blank/null category values before grouping.
-            """
-            try:
-                import pandas as _pd
-                df = structured_to_df(sd)
-                if df.empty:
-                    return None
-                df = df.drop(columns=[c for c in df.columns if c.startswith("_")], errors="ignore")
-                cat_cols = df.select_dtypes(include="object").columns.tolist()
-                if not cat_cols:
-                    return None
-                # Pick lowest non-zero cardinality (excludes Name/ID columns with unique values)
-                def _nunique_clean(col):
-                    return df[col].replace("", _pd.NA).dropna().nunique() or 9999
-                best_col = min(cat_cols, key=_nunique_clean)
-                # Filter blank/null values in the groupby column before counting
-                df = df[df[best_col].notna() & (df[best_col].astype(str).str.strip() != "")]
-                plan = {
-                    "operation":    "groupby",
-                    "group_by":     [best_col],
-                    "aggregations": [{"type": "count", "column": "*"}],
-                    "select":       [],
-                    "filters":      [],
-                    "chart": {
-                        "type":     "pie" if "pie" in q.lower() else "bar",
-                        "x_col":    best_col,
-                        "y_cols":   ["count"],
-                        "pivot_col": None,
-                    },
-                }
-                result = execute_plan(df, plan)
-                logging.info("_run_engine_fallback: grouped by '%s' → %d rows", best_col, len(result.get("rows", [])))
+                df      = df.drop(columns=[c for c in df.columns if c.startswith("_")], errors="ignore")
+                cols    = list(df.columns)
+                plan    = generate_plan(query, cols)
+                result  = execute_plan(df, plan)
                 return result
             except Exception as exc:
-                logging.warning("_run_engine_fallback failed: %s", exc)
+                logging.warning("_run_engine_local failed: %s", exc)
                 return None
 
-        # For distribution/pie/breakdown queries always use COUNT fallback directly —
-        # the LLM planner often misreads "distribution of X by Y" as SUM(X) instead of COUNT(*)
-        # But NOT when the query asks for avg/sum/total — those need the real engine.
-        _has_agg_intent = any(k in q_lower for k in (
-            "average", "avg", "mean", "sum", "total", "highest", "lowest", "top", "bottom", "max", "min",
-        ))
-        _is_distribution = not _has_agg_intent and any(k in q_lower for k in (
-            "distribution", "pie chart", "breakdown", "by category", "by department",
-            "how many", "count by", "number of",
-        ))
-        engine_result = _run_engine_fallback(query, stored_sd) if _is_distribution else _run_engine(query, stored_sd)
-
-        # Retry with fallback if primary engine returned error or empty rows
-        if not engine_result or engine_result.get("type") == "error" or not engine_result.get("rows"):
-            logging.info("run_rag_pipeline: primary engine failed/empty — trying fallback groupby plan")
-            engine_result = _run_engine_fallback(query, stored_sd)
-
+        engine_result = _run_engine_local(query, stored_sd)
         if engine_result and engine_result.get("type") != "error":
             rows = engine_result.get("rows", [])
             if rows or engine_result.get("type") == "text":
-                # Promote table → chart when user asked for a chart
-                if engine_result.get("type") != "chart" and any(k in q_lower for k in _CHART_KEYWORDS):
+                # Promote to chart with correct type if query has chart intent
+                if engine_result.get("type") != "chart":
+                    from services.query_engine import promote_to_chart
                     try:
                         df   = structured_to_df(stored_sd)
-                        plan = generate_plan(query, list(df.columns))
-                        if plan.get("group_by"):
+                        cols = list(df.columns)
+                        plan = generate_plan(query, cols)
+                        if any(k in query.lower() for k in _CHART_KEYWORDS) and plan.get("group_by"):
                             engine_result = promote_to_chart(engine_result, query)
                     except Exception:
                         pass
-                # Clean chart data (labels/values shape)
+                # Clean chart data if applicable (Shape A: labels/values)
                 if engine_result.get("type") == "chart" and engine_result.get("labels"):
                     engine_result = _clean_chart_data(engine_result, user_query=query)
                 result = {k: v for k, v in engine_result.items() if k != "sources"}
                 _cache_result(cache_key, result)
                 return result
-
+        # Fall through to prose RAG if engine fails
         logging.info("run_rag_pipeline: structured engine failed — falling back to prose RAG")
 
-    # ── Step 5: Contextual compression ───────────────────────────────────
+    # ── Step 7: Contextual compression ───────────────────────────────────
     if use_compression and len(chunks) > 2:
         compressed_chunks = compress_chunks(query, chunks)
     else:
         compressed_chunks = chunks
 
-    # ── Step 6: Grounded generation ───────────────────────────────────────
+    # ── Step 8: Grounded generation ───────────────────────────────────────
+    q_lower = query.lower()
     if intent == "hybrid":
         response_format = "table"
     elif any(k in q_lower for k in _CHART_KEYWORDS):
@@ -887,7 +801,7 @@ def run_rag_pipeline(
         response_format = response_format,
     )
 
-    # ── Step 7: Cache and return ──────────────────────────────────────────
+    # ── Step 9: Cache and return ──────────────────────────────────────────
     _cache_result(cache_key, result)
     return result
 

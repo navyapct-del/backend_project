@@ -117,7 +117,9 @@ def extract_with_structured(file_bytes: bytes, filename: str) -> tuple[str, dict
     name = filename.lower()
     structured_data = None
 
-    if name.endswith(".pdf") or name.endswith((".jpg", ".jpeg", ".png", ".svg")):
+    if name.endswith(".pdf"):
+        text = _extract_pdf_text(file_bytes, filename)
+    elif name.endswith((".jpg", ".jpeg", ".png", ".svg")):
         text = _ocr(file_bytes, name)
     elif name.endswith(".csv"):
         text, structured_data = _csv_to_text_and_struct(file_bytes)
@@ -251,8 +253,59 @@ def _process_excel(file_bytes: bytes, filename: str) -> dict:
 # C. PDF processor
 # ---------------------------------------------------------------------------
 
+def _extract_pdf_text(file_bytes: bytes, filename: str) -> str:
+    """
+    Try three extraction methods in order, returning the first that yields >= 50 chars.
+    1. Azure Document Intelligence (handles scanned/image PDFs via OCR)
+    2. PyPDF2 (fast native text layer)
+    3. pdfplumber (more robust text layer fallback)
+    """
+    _PDF_MIN = 50
+
+    # 1. Azure Document Intelligence
+    try:
+        text = _ocr(file_bytes, filename)
+        if len(text.strip()) >= _PDF_MIN:
+            logging.info("PDF extraction: Document Intelligence succeeded (%d chars) for '%s'", len(text), filename)
+            return text
+        logging.warning("PDF extraction: Document Intelligence returned %d chars for '%s', trying fallbacks", len(text.strip()), filename)
+    except Exception as exc:
+        logging.warning("PDF extraction: Document Intelligence failed for '%s': %s", filename, exc)
+        text = ""
+
+    # 2. PyPDF2
+    try:
+        import PyPDF2
+        reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+        pages_text = [reader.pages[i].extract_text() or "" for i in range(len(reader.pages))]
+        pypdf_text = "\n".join(pages_text).strip()
+        if len(pypdf_text) >= _PDF_MIN:
+            logging.info("PDF extraction: PyPDF2 succeeded (%d chars) for '%s'", len(pypdf_text), filename)
+            return pypdf_text
+        logging.warning("PDF extraction: PyPDF2 returned %d chars for '%s', trying pdfplumber", len(pypdf_text), filename)
+    except Exception as exc:
+        logging.warning("PDF extraction: PyPDF2 failed for '%s': %s", filename, exc)
+
+    # 3. pdfplumber
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            pages_text = [page.extract_text() or "" for page in pdf.pages]
+        plumber_text = "\n".join(pages_text).strip()
+        if len(plumber_text) >= _PDF_MIN:
+            logging.info("PDF extraction: pdfplumber succeeded (%d chars) for '%s'", len(plumber_text), filename)
+            return plumber_text
+        logging.warning("PDF extraction: pdfplumber returned %d chars for '%s'", len(plumber_text), filename)
+    except Exception as exc:
+        logging.warning("PDF extraction: pdfplumber failed for '%s': %s", filename, exc)
+
+    # Return whatever we got from DI (may be empty)
+    logging.error("PDF extraction: all methods failed to extract >= %d chars for '%s'", _PDF_MIN, filename)
+    return text
+
+
 def _process_pdf(file_bytes: bytes, filename: str) -> dict:
-    text = _ocr(file_bytes, filename)
+    text = _extract_pdf_text(file_bytes, filename)
     return {
         "type":     "document",
         "filename": filename,
