@@ -87,62 +87,50 @@ def analyze_image(image_id: str, question: str) -> str:
     client = _get_client()
     deployment = _vision_deployment()
 
-    # ── Step 1: Ask GPT-4o to identify the person directly ────────────────
-    _ID_PROMPT = (
-        "You are an expert at identifying well-known public figures from photos.\n"
-        "Look at the PERSON in this image (ignore the background).\n\n"
-        "If you can identify them as a known public figure (politician, scientist, "
-        "celebrity, athlete, historical figure, etc.), respond with ONLY their full name "
-        "and nothing else. Example: 'A. P. J. Abdul Kalam'\n\n"
-        "If you cannot identify them with confidence, respond with ONLY the word: UNKNOWN"
-    )
+    image_data = {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}}
 
-    id_resp = client.chat.completions.create(
+    # ── Step 1: Extract any visible text / name from the image ────────────
+    text_resp = client.chat.completions.create(
         model=deployment,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
-                {"type": "text", "text": _ID_PROMPT},
-            ],
-        }],
-        max_tokens=30,
+        messages=[{"role": "user", "content": [
+            image_data,
+            {"type": "text", "text": (
+                "Read ALL visible text in this image exactly as written: "
+                "captions, watermarks, name tags, banners, jersey names, title cards, subtitles. "
+                "Return only the text you see, or 'NONE' if there is no text."
+            )},
+        ]}],
+        max_tokens=60,
     )
-    identified_name = id_resp.choices[0].message.content.strip().strip("'\"")
-    logging.info("analyze_image: identified_name=%r", identified_name)
+    visible_text = text_resp.choices[0].message.content.strip()
+    logging.info("analyze_image: visible_text=%r", visible_text)
 
-    # ── Step 2: If GPT identified a name, enrich with Wikipedia ───────────
-    if identified_name and identified_name.upper() != "UNKNOWN" and len(identified_name) > 3:
-        wiki = _wikipedia_lookup_by_name(identified_name)
+    # ── Step 2: If text found, search Wikipedia for the name ──────────────
+    if visible_text and visible_text.upper() != "NONE" and len(visible_text) > 2:
+        wiki = _wikipedia_lookup_by_name(visible_text)
         if wiki:
-            answer = f"This is {wiki}"
-        else:
-            answer = f"This appears to be {identified_name}."
-    else:
-        # ── Step 3: GPT couldn't identify — describe the person naturally ──
-        desc_resp = client.chat.completions.create(
-            model=deployment,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Describe the person in the image: their appearance, clothing, "
-                        "approximate age, expression, and setting. Be natural and conversational. "
-                        "Do not use labels like 'Visible text:' or structured formats."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
-                        {"type": "text", "text": question},
-                    ],
-                },
-            ],
-            max_tokens=400,
-        )
-        answer = desc_resp.choices[0].message.content.strip()
+            return f"This is {wiki}"
 
+    # ── Step 3: Ask GPT-4o to describe the person in detail ───────────────
+    # GPT-4o cannot identify faces but can describe appearance, clothing,
+    # setting, and any contextual clues that help the user understand the image.
+    desc_resp = client.chat.completions.create(
+        model=deployment,
+        messages=[
+            {"role": "system", "content": (
+                "You are a visual assistant. When shown an image of a person:\n"
+                "1. Describe their physical appearance in detail: age, build, hair, facial features\n"
+                "2. Describe their clothing and any visible accessories or medals\n"
+                "3. Describe the setting and background\n"
+                "4. Note any cultural, professional, or historical context clues\n"
+                "5. If the image has any text, captions, or labels, mention them\n"
+                "Be specific and detailed. Do NOT say 'I cannot identify' — just describe what you see."
+            )},
+            {"role": "user", "content": [image_data, {"type": "text", "text": question}]},
+        ],
+        max_tokens=500,
+    )
+    answer = desc_resp.choices[0].message.content.strip()
     logging.info("analyze_image: image_id=%s answer_len=%d", image_id, len(answer))
     return answer
 
