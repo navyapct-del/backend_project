@@ -109,6 +109,27 @@ IMAGE_QA_SIGNALS = [
     "explain this picture",
     "what do you see in",
     "describe what you see",
+    # Celebrity / person description — natural language
+    "who is this",
+    "who is he",
+    "who is she",
+    "who is this person",
+    "who is this celebrity",
+    "tell me about this person",
+    "tell me about this celebrity",
+    "describe this celebrity",
+    "describe this person",
+    "what do you know about this person",
+    "what can you tell me about this person",
+    "what can you tell me about this",
+    "give me information about this person",
+    "give me details about this person",
+    "what is his name",
+    "what is her name",
+    "can you identify",
+    "do you know who this is",
+    "do you recognise",
+    "do you recognize",
 ]
 
 DOCUMENT_QA_SIGNALS = [
@@ -208,7 +229,7 @@ def _stage1_keyword(
     """Fast O(n) keyword scan evaluated in priority order."""
     q_lower = query.lower() if query else ""
 
-    # 1. Image search — highest priority
+    # 1. Image search — highest priority (no image attached)
     if any(signal in q_lower for signal in IMAGE_SEARCH_SIGNALS):
         return "image_search"
 
@@ -218,7 +239,7 @@ def _stage1_keyword(
     if words and words[-1] in _PHOTO_SUFFIXES:
         return "image_search"
 
-    # 2. Image Q&A — only when an image is attached
+    # 2. Image Q&A — when an image is attached and query matches a signal
     if image_id is not None and any(signal in q_lower for signal in IMAGE_QA_SIGNALS):
         return "image_qa"
 
@@ -226,21 +247,23 @@ def _stage1_keyword(
     if any(signal in q_lower for signal in DOCUMENT_QA_SIGNALS):
         return "document_qa"
 
-    # 4. Follow-up — explicit signal OR short pronoun-bearing query with prior context
+    # 4. If image is attached — route to image_qa regardless of query wording.
+    #    This must come BEFORE the followup pronoun check so that queries like
+    #    "tell me about him" or "who is this?" with an attached image go to
+    #    image_qa instead of followup.
+    if image_id is not None:
+        return "image_qa"
+
+    # 5. Follow-up — explicit signal OR short pronoun-bearing query with prior context
     if any(signal in q_lower for signal in FOLLOWUP_SIGNALS):
         return "followup"
 
-    words = q_lower.split()
     if (
         len(words) <= 5
         and bool(session_context)
         and any(pronoun in words for pronoun in FOLLOWUP_PRONOUNS)
     ):
         return "followup"
-
-    # 5. If image is attached and no other intent matched — treat as image Q&A
-    if image_id is not None:
-        return "image_qa"
 
     # 6. Default
     return "general_qa"
