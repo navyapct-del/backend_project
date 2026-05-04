@@ -804,11 +804,13 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
 
     user_query      = req.params.get("q", "")
     filename_filter = req.params.get("filename", "")
+    doc_ids         = None
     if not user_query:
         try:
             body            = req.get_json()
             user_query      = body.get("q", "")
             filename_filter = body.get("filename", filename_filter)
+            doc_ids         = body.get("doc_ids") or None
         except Exception:
             pass
 
@@ -829,6 +831,13 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
             uploaded_by = jwt_payload.get("email") or jwt_payload.get("preferred_username") or ""
         except Exception:
             pass
+    # Fallback: read uploaded_by from request body (used by frontend without JWT)
+    if not uploaded_by:
+        try:
+            body = req.get_json()
+            uploaded_by = body.get("uploaded_by", "")
+        except Exception:
+            pass
 
     try:
         t0 = time.time()
@@ -841,6 +850,7 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
             top_k           = 7,
             use_hyde        = True,
             use_compression = True,
+            doc_ids         = doc_ids,
         )
 
         resp_type    = result.get("type", "text")

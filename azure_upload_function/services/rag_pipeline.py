@@ -155,6 +155,7 @@ def multi_query_retrieve(
     filename_filter: str = "",
     uploaded_by: str = "",
     use_hyde: bool = True,
+    doc_ids: list[str] | None = None,
 ) -> list[dict]:
     """
     Retrieve chunks using multiple query variants + HyDE for better recall.
@@ -191,6 +192,7 @@ def multi_query_retrieve(
             top             = top_k,
             filename_filter = filename_filter,
             uploaded_by     = uploaded_by,
+            doc_ids         = doc_ids,
         )
         for chunk in chunks:
             cid = chunk["id"]
@@ -208,6 +210,7 @@ def multi_query_retrieve(
                 top             = top_k,
                 filename_filter = filename_filter,
                 uploaded_by     = uploaded_by,
+                doc_ids         = doc_ids,
             )
         return []
 
@@ -604,6 +607,7 @@ def run_rag_pipeline(
     top_k:           int = 7,
     use_hyde:        bool = True,
     use_compression: bool = True,
+    doc_ids:         list[str] | None = None,
 ) -> dict:
     """
     Full advanced RAG pipeline entry point.
@@ -629,6 +633,7 @@ def run_rag_pipeline(
         filename_filter = filename_filter,
         uploaded_by     = uploaded_by,
         use_hyde        = use_hyde,
+        doc_ids         = doc_ids,
     )
 
     if not chunks:

@@ -217,6 +217,7 @@ def vector_search(
     top:             int = _TOP_K,
     filename_filter: str = "",
     uploaded_by:     str = "",
+    doc_ids:         list[str] | None = None,
     min_score:       float = MIN_SCORE,
 ) -> list[dict]:
     """
@@ -250,7 +251,20 @@ def vector_search(
     except Exception:
         pass
 
-    if filename_filter:
+    if doc_ids and len(doc_ids) > 0:
+        # OData search.in filter — most efficient multi-value filter in Azure AI Search
+        safe_ids = ",".join(d.replace("'", "''") for d in doc_ids)
+        doc_filter = f"search.in(doc_id, '{safe_ids}', ',')"
+        if uploaded_by:
+            safe = uploaded_by.replace("'", "''")
+            search_kwargs["filter"] = f"uploaded_by eq '{safe}' and {doc_filter}"
+        else:
+            search_kwargs["filter"] = doc_filter
+    elif filename_filter and uploaded_by:
+        safe = uploaded_by.replace("'", "''")
+        fn   = filename_filter.replace("'", "''")
+        search_kwargs["filter"] = f"uploaded_by eq '{safe}' and filename eq '{fn}'"
+    elif filename_filter:
         search_kwargs["filter"] = f"filename eq '{filename_filter}'"
     elif uploaded_by:
         safe = uploaded_by.replace("'", "''")
