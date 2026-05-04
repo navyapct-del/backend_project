@@ -86,58 +86,68 @@ def analyze_image(image_id: str, question: str) -> str:
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     client = _get_client()
     deployment = _vision_deployment()
-
     image_data = {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}}
 
-    # ── Step 1: Use filename as identity hint ─────────────────────────────
-    # Filenames like "apj_image.png", "gandhi_photo.jpg", "elon_musk.png"
-    # often contain the person's name — extract and look up Wikipedia directly.
-    name_from_file = _name_from_filename(filename)
-    logging.info("analyze_image: name_from_file=%r", name_from_file)
-    if name_from_file:
-        wiki = _wikipedia_lookup_by_name(name_from_file, person_only=True)
-        if wiki:
-            return f"This is {wiki}"
+    # ── Step 1: Use filename hint + GPT-4o to confirm identity ────────────
+    name_hint = _name_from_filename(filename)
+    logging.info("analyze_image: name_hint=%r", name_hint)
 
-    # ── Step 2: Ask GPT-4o to read any visible text in the image ──────────
+    if name_hint:
+        hint_resp = client.chat.completions.create(
+            model=deployment,
+            messages=[{"role": "user", "content": [
+                image_data,
+                {"type": "text", "text": (
+                    f"The filename of this image is '{filename}', suggesting this may be '{name_hint}'. "
+                    f"Look at the image and confirm: does the person's appearance, clothing, setting, "
+                    f"or any visible text match someone named '{name_hint}'? "
+                    f"Reply with ONLY 'YES' or 'NO'."
+                )},
+            ]}],
+            max_tokens=5,
+        )
+        confirmed = hint_resp.choices[0].message.content.strip().upper().startswith("Y")
+        logging.info("analyze_image: hint confirmed=%s", confirmed)
+        if confirmed:
+            wiki = _wikipedia_lookup_by_name(name_hint, person_only=True)
+            if wiki:
+                return f"This is {wiki}"
+
+    # ── Step 2: Read visible text in image → Wikipedia ────────────────────
     text_resp = client.chat.completions.create(
         model=deployment,
         messages=[{"role": "user", "content": [
             image_data,
             {"type": "text", "text": (
-                "List ALL text visible in this image: name tags, captions, watermarks, "
-                "banners, title cards, subtitles, jersey names. "
-                "Return only the text exactly as written, or 'NONE'."
+                "List ALL text visible in this image: captions, watermarks, name tags, "
+                "banners, title cards, subtitles. Return only the text, or 'NONE'."
             )},
         ]}],
         max_tokens=80,
     )
     visible_text = text_resp.choices[0].message.content.strip()
     logging.info("analyze_image: visible_text=%r", visible_text)
-
     if visible_text and visible_text.upper() != "NONE":
-        wiki = _wikipedia_lookup_by_name(visible_text)
+        wiki = _wikipedia_lookup_by_name(visible_text, person_only=True)
         if wiki:
             return f"This is {wiki}"
 
-    # ── Step 3: Force GPT-4o to describe — never refuse ───────────────────
+    # ── Step 3: GPT-4o describes → extract clues → Wikipedia ──────────────
     desc_resp = client.chat.completions.create(
         model=deployment,
         messages=[
             {"role": "system", "content": (
-                "You are a visual description assistant. Your job is ONLY to describe "
-                "what you see — never to identify or name anyone. "
-                "Describe: approximate age, gender, hair, clothing, expression, setting, "
-                "any medals/badges/insignia, cultural indicators, era. "
-                "Be specific and detailed. Never say 'I cannot identify' or 'I'm unable'."
+                "Describe the person in the image in detail: approximate age, gender, "
+                "hair, clothing, medals/badges, setting, nationality/cultural indicators, era. "
+                "Be specific. Never say 'I cannot identify'."
             )},
             {"role": "user", "content": [image_data, {"type": "text", "text": "Describe this person in detail."}]},
         ],
-        max_tokens=400,
+        max_tokens=300,
     )
     description = desc_resp.choices[0].message.content.strip()
+    logging.info("analyze_image: description=%r", description[:100])
 
-    # ── Step 4: Use description clues to search Wikipedia ─────────────────
     wiki = _wikipedia_lookup_by_description(description)
     if wiki:
         return f"Based on the visual clues, this appears to be {wiki}"
