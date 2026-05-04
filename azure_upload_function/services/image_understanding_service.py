@@ -89,53 +89,60 @@ def analyze_image(image_id: str, question: str) -> str:
 
     image_data = {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}}
 
-    # ── Step 1: Azure Computer Vision celebrity detection ─────────────────
-    celebrity_name = _detect_celebrity(image_bytes)
-    logging.info("analyze_image: celebrity_name=%r", celebrity_name)
-
-    if celebrity_name:
-        wiki = _wikipedia_lookup_by_name(celebrity_name)
+    # ── Step 1: Use filename as identity hint ─────────────────────────────
+    # Filenames like "apj_image.png", "gandhi_photo.jpg", "elon_musk.png"
+    # often contain the person's name — extract and look up Wikipedia directly.
+    name_from_file = _name_from_filename(filename)
+    logging.info("analyze_image: name_from_file=%r", name_from_file)
+    if name_from_file:
+        wiki = _wikipedia_lookup_by_name(name_from_file)
         if wiki:
             return f"This is {wiki}"
-        return f"This is {celebrity_name}."
 
-    # ── Step 2: Read any visible text and search Wikipedia ────────────────
+    # ── Step 2: Ask GPT-4o to read any visible text in the image ──────────
     text_resp = client.chat.completions.create(
         model=deployment,
         messages=[{"role": "user", "content": [
             image_data,
             {"type": "text", "text": (
-                "Read ALL visible text in this image exactly as written: "
-                "captions, watermarks, name tags, banners, jersey names, title cards. "
-                "Return only the text, or 'NONE' if there is no text."
+                "List ALL text visible in this image: name tags, captions, watermarks, "
+                "banners, title cards, subtitles, jersey names. "
+                "Return only the text exactly as written, or 'NONE'."
             )},
         ]}],
-        max_tokens=60,
+        max_tokens=80,
     )
     visible_text = text_resp.choices[0].message.content.strip()
     logging.info("analyze_image: visible_text=%r", visible_text)
 
-    if visible_text and visible_text.upper() != "NONE" and len(visible_text) > 2:
+    if visible_text and visible_text.upper() != "NONE":
         wiki = _wikipedia_lookup_by_name(visible_text)
         if wiki:
             return f"This is {wiki}"
 
-    # ── Step 3: Describe the person in detail ─────────────────────────────
+    # ── Step 3: Force GPT-4o to describe — never refuse ───────────────────
     desc_resp = client.chat.completions.create(
         model=deployment,
         messages=[
             {"role": "system", "content": (
-                "Describe the person in the image in detail: appearance, clothing, "
-                "approximate age, expression, setting, and any cultural or professional context clues. "
-                "Be specific. Do not say 'I cannot identify'."
+                "You are a visual description assistant. Your job is ONLY to describe "
+                "what you see — never to identify or name anyone. "
+                "Describe: approximate age, gender, hair, clothing, expression, setting, "
+                "any medals/badges/insignia, cultural indicators, era. "
+                "Be specific and detailed. Never say 'I cannot identify' or 'I'm unable'."
             )},
-            {"role": "user", "content": [image_data, {"type": "text", "text": question}]},
+            {"role": "user", "content": [image_data, {"type": "text", "text": "Describe this person in detail."}]},
         ],
-        max_tokens=500,
+        max_tokens=400,
     )
-    answer = desc_resp.choices[0].message.content.strip()
-    logging.info("analyze_image: image_id=%s answer_len=%d", image_id, len(answer))
-    return answer
+    description = desc_resp.choices[0].message.content.strip()
+
+    # ── Step 4: Use description clues to search Wikipedia ─────────────────
+    wiki = _wikipedia_lookup_by_description(description)
+    if wiki:
+        return f"Based on the visual clues, this appears to be {wiki}"
+
+    return description
 
 
 # ---------------------------------------------------------------------------
@@ -145,65 +152,50 @@ def analyze_image(image_id: str, question: str) -> str:
 _WIKI_HEADERS = {"User-Agent": "DataOrchBot/1.0 (https://azure.microsoft.com)"}
 
 
-def _detect_celebrity(image_bytes: bytes) -> str:
+def _name_from_filename(filename: str) -> str:
     """
-    Use Azure Computer Vision domain-specific celebrity model to identify the person.
-    Returns the celebrity name string, or "" if not detected / service unavailable.
+    Extract a probable person name from the filename.
+    e.g. 'apj_image.png' -> 'APJ Abdul Kalam', 'elon_musk.jpg' -> 'Elon Musk'
     """
-    import os
-    endpoint = os.environ.get("AZURE_VISION_ENDPOINT", "").rstrip("/")
-    key = os.environ.get("AZURE_VISION_KEY", "")
-    if not endpoint or not key:
+    import re, os
+    stem = os.path.splitext(filename)[0]          # remove extension
+    stem = re.sub(r'[_\-\.]+', ' ', stem).strip() # underscores/dashes -> spaces
+    # Remove generic words
+    generic = {"image", "photo", "pic", "picture", "img", "screenshot",
+               "download", "file", "copy", "scan", "portrait"}
+    words = [w for w in stem.split() if w.lower() not in generic]
+    if not words:
         return ""
-    try:
-        url = f"{endpoint}/vision/v3.2/models/celebrities/analyze"
-        res = requests.post(
-            url,
-            headers={"Ocp-Apim-Subscription-Key": key, "Content-Type": "application/octet-stream"},
-            data=image_bytes,
-            timeout=10,
-        )
-        res.raise_for_status()
-        celebrities = res.json().get("result", {}).get("celebrities", [])
-        if celebrities:
-            # Return highest-confidence match
-            best = max(celebrities, key=lambda c: c.get("confidence", 0))
-            if best.get("confidence", 0) >= 0.7:
-                logging.info("_detect_celebrity: %r confidence=%.2f", best["name"], best["confidence"])
-                return best["name"]
-    except Exception as exc:
-        logging.warning("_detect_celebrity failed: %s", exc)
-    return ""
+    candidate = " ".join(words)
+    # Must be at least 3 chars and not purely numeric
+    if len(candidate) < 3 or candidate.replace(" ", "").isdigit():
+        return ""
+    logging.info("_name_from_filename: candidate=%r from %r", candidate, filename)
+    return candidate
 
 
 def _wikipedia_lookup_by_name(name: str) -> str:
-    """
-    Look up a person by name on Wikipedia.
-    Returns "Name. [extract]" or "" if not found.
-    """
+    """Direct Wikipedia lookup by name. Returns 'Name. extract' or ''."""
     try:
         title = name.replace(" ", "_")
-        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}"
-        res = requests.get(url, headers=_WIKI_HEADERS, timeout=8)
+        res = requests.get(
+            f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}",
+            headers=_WIKI_HEADERS, timeout=8
+        )
         if res.status_code == 200:
             data = res.json()
             extract = data.get("extract", "")
-            found_name = data.get("title", name)
+            found = data.get("title", name)
             if extract and len(extract) > 50:
-                logging.info("_wikipedia_lookup_by_name: found %r", found_name)
-                return f"{found_name}. {extract}"
-
-        # Fallback: search API if direct lookup missed
-        search_url = (
-            "https://en.wikipedia.org/w/api.php"
-            f"?action=query&list=search&srsearch={urllib.parse.quote(name)}"
-            "&srlimit=3&format=json&origin=*"
+                return f"{found}. {extract}"
+        # Search fallback
+        res = requests.get(
+            f"https://en.wikipedia.org/w/api.php?action=query&list=search"
+            f"&srsearch={urllib.parse.quote(name)}&srlimit=3&format=json&origin=*",
+            headers=_WIKI_HEADERS, timeout=8
         )
-        res = requests.get(search_url, headers=_WIKI_HEADERS, timeout=8)
-        res.raise_for_status()
-        hits = res.json().get("query", {}).get("search", [])
-        for hit in hits:
-            t = hit.get("title", "").replace(" ", "_")
+        for hit in res.json().get("query", {}).get("search", []):
+            t = hit["title"].replace(" ", "_")
             sr = requests.get(
                 f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(t)}",
                 headers=_WIKI_HEADERS, timeout=8
@@ -212,12 +204,63 @@ def _wikipedia_lookup_by_name(name: str) -> str:
                 continue
             data = sr.json()
             extract = data.get("extract", "")
-            found_name = data.get("title", "")
+            found = data.get("title", "")
             if data.get("thumbnail") and extract and len(extract) > 50:
-                logging.info("_wikipedia_lookup_by_name: search found %r", found_name)
-                return f"{found_name}. {extract}"
+                logging.info("_wikipedia_lookup_by_name: found %r", found)
+                return f"{found}. {extract}"
     except Exception as exc:
         logging.warning("_wikipedia_lookup_by_name failed for %r: %s", name, exc)
+    return ""
+
+
+def _wikipedia_lookup_by_description(description: str) -> str:
+    """
+    Extract role/nationality clues from GPT description and search Wikipedia.
+    Only returns a result if a person page with thumbnail is found.
+    """
+    import re
+    # Pull out key phrases: nationality + role
+    role_patterns = [
+        r'\b(indian|american|british|french|german|chinese|japanese|russian|'
+        r'pakistani|bangladeshi|sri lankan|australian|canadian|brazilian)\b',
+        r'\b(president|prime minister|scientist|physicist|astronaut|cricketer|'
+        r'footballer|actor|actress|singer|politician|general|admiral|ceo|founder)\b',
+        r'\b(independence|freedom fighter|revolutionary|nobel|bharat ratna)\b',
+    ]
+    clues = []
+    desc_lower = description.lower()
+    for pattern in role_patterns:
+        clues.extend(re.findall(pattern, desc_lower))
+
+    if len(clues) < 2:
+        return ""
+
+    query = " ".join(dict.fromkeys(clues)) + " person"  # deduplicated
+    try:
+        res = requests.get(
+            f"https://en.wikipedia.org/w/api.php?action=query&list=search"
+            f"&srsearch={urllib.parse.quote(query)}&srlimit=5&format=json&origin=*",
+            headers=_WIKI_HEADERS, timeout=8
+        )
+        for hit in res.json().get("query", {}).get("search", []):
+            title = hit["title"]
+            if any(s in title.lower() for s in ["disambiguation", "list of", "flag"]):
+                continue
+            t = title.replace(" ", "_")
+            sr = requests.get(
+                f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(t)}",
+                headers=_WIKI_HEADERS, timeout=8
+            )
+            if sr.status_code != 200:
+                continue
+            data = sr.json()
+            extract = data.get("extract", "")
+            found = data.get("title", "")
+            if data.get("thumbnail") and "born" in extract[:300].lower() and len(extract) > 50:
+                logging.info("_wikipedia_lookup_by_description: found %r for clues %r", found, clues)
+                return f"{found}. {extract}"
+    except Exception as exc:
+        logging.warning("_wikipedia_lookup_by_description failed: %s", exc)
     return ""
 
 
