@@ -42,6 +42,19 @@ IMAGE_SEARCH_SIGNALS = [
     "find photos",
     "get images",
     "fetch images",
+    # Natural person/celebrity image requests
+    "show me a photo",
+    "show me photos",
+    "show me a picture",
+    "show me pictures",
+    "get me a photo",
+    "get me photos",
+    "get me a picture",
+    "get me pictures",
+    "search photo",
+    "search picture",
+    "look up photo",
+    "look up image",
 ]
 
 IMAGE_QA_SIGNALS = [
@@ -197,6 +210,12 @@ def _stage1_keyword(
 
     # 1. Image search — highest priority
     if any(signal in q_lower for signal in IMAGE_SEARCH_SIGNALS):
+        return "image_search"
+
+    # 1b. Detect "<Name> photo/picture/image" patterns (e.g. "Elon Musk photo")
+    _PHOTO_SUFFIXES = ("photo", "photos", "picture", "pictures", "image", "images", "pic", "pics")
+    words = q_lower.split()
+    if words and words[-1] in _PHOTO_SUFFIXES:
         return "image_search"
 
     # 2. Image Q&A — only when an image is attached

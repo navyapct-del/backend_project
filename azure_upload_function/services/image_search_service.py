@@ -150,50 +150,84 @@ def _search_searxng(query: str, base_url: str) -> list[dict]:
 def _search_wikimedia_commons(query: str) -> list[dict]:
     """
     Search Wikimedia Commons for images matching the query.
+
+    For person/celebrity queries, appends "portrait" to improve photo hit rate.
+    Uses a batch imageinfo call instead of one request per file.
     Returns up to MAX_RESULTS items.
     """
-    encoded = urllib.parse.quote(query)
+    # Detect person-like queries (two capitalised words or known person signals)
+    words = query.split()
+    is_person_query = (
+        len(words) >= 2
+        and all(w[0].isupper() for w in words if w.isalpha())
+    )
+
+    # Use a portrait-biased search term for people to surface actual photos
+    search_term = f"{query} portrait" if is_person_query else query
+    encoded = urllib.parse.quote(search_term)
+
     search_url = (
         "https://commons.wikimedia.org/w/api.php"
         f"?action=query&list=search&srsearch={encoded}&srnamespace=6"
-        f"&srlimit={MAX_RESULTS * 3}&format=json&origin=*"
+        f"&srlimit={MAX_RESULTS * 5}&format=json&origin=*"
     )
     res = requests.get(search_url, headers=HEADERS, timeout=10)
     res.raise_for_status()
 
-    results = []
+    # Collect candidate titles (photo extensions only; skip obvious non-photos)
+    candidates = []
     for item in res.json().get("query", {}).get("search", []):
         title = item.get("title", "")
         if not title.startswith("File:"):
             continue
         lower = title.lower()
-        if any(s in lower for s in ["logo", "icon", "flag", "map", "chart", "diagram", "svg"]):
+        # Only skip clearly non-photographic file types
+        if lower.endswith(".svg"):
             continue
-        if not any(title.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
+        # For non-person queries keep the stricter keyword filter;
+        # for person queries only skip logos/icons (not maps/charts which rarely appear)
+        if is_person_query:
+            if any(s in lower for s in ["logo", "icon"]):
+                continue
+        else:
+            if any(s in lower for s in ["logo", "icon", "flag", "map", "chart", "diagram"]):
+                continue
+        if not any(lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
             continue
-        try:
-            info_url = (
-                "https://commons.wikimedia.org/w/api.php"
-                f"?action=query&titles={urllib.parse.quote(title)}"
-                "&prop=imageinfo&iiprop=url|thumburl&iiurlwidth=400"
-                "&format=json&origin=*"
-            )
-            info_res = requests.get(info_url, headers=HEADERS, timeout=8)
-            info_res.raise_for_status()
-            for page in info_res.json().get("query", {}).get("pages", {}).values():
-                ii = page.get("imageinfo", [{}])[0]
-                full_url = ii.get("url", "")
-                thumb    = ii.get("thumburl", full_url)
-                if full_url:
-                    results.append({
-                        "url":       full_url,
-                        "thumbnail": thumb,
-                        "title":     title.replace("File:", ""),
-                    })
-                    break
-        except Exception:
-            continue
+        candidates.append(title)
+        if len(candidates) >= MAX_RESULTS * 3:
+            break
 
+    if not candidates:
+        return []
+
+    # Batch imageinfo request — one API call for all candidates
+    titles_param = "|".join(urllib.parse.quote(t) for t in candidates[:MAX_RESULTS * 2])
+    info_url = (
+        "https://commons.wikimedia.org/w/api.php"
+        f"?action=query&titles={titles_param}"
+        "&prop=imageinfo&iiprop=url|thumburl&iiurlwidth=400"
+        "&format=json&origin=*"
+    )
+    try:
+        info_res = requests.get(info_url, headers=HEADERS, timeout=12)
+        info_res.raise_for_status()
+        pages = info_res.json().get("query", {}).get("pages", {})
+    except Exception:
+        return []
+
+    results = []
+    for page in pages.values():
+        ii = page.get("imageinfo", [{}])[0]
+        full_url = ii.get("url", "")
+        thumb    = ii.get("thumburl", full_url)
+        raw_title = page.get("title", "")
+        if full_url:
+            results.append({
+                "url":       full_url,
+                "thumbnail": thumb,
+                "title":     raw_title.replace("File:", ""),
+            })
         if len(results) >= MAX_RESULTS:
             break
 
@@ -206,23 +240,29 @@ def _search_wikimedia_commons(query: str) -> list[dict]:
 
 def _search_wikipedia(query: str) -> list[dict]:
     """
-    Search Wikipedia for the query and return the main page thumbnail.
-    Returns at most 1 result.
+    Search Wikipedia for the query and return up to MAX_RESULTS page thumbnails.
+    Tries multiple query variations to maximise hit rate for person queries.
     """
     variations = _build_query_variations(query)
+    results: list[dict] = []
+    seen_urls: set[str] = set()
 
     for variation in variations:
+        if len(results) >= MAX_RESULTS:
+            break
         try:
             search_url = (
                 "https://en.wikipedia.org/w/api.php"
                 f"?action=query&list=search&srsearch={urllib.parse.quote(variation)}"
-                "&srlimit=3&format=json&origin=*"
+                f"&srlimit={MAX_RESULTS}&format=json&origin=*"
             )
             search_res = requests.get(search_url, headers=HEADERS, timeout=10)
             search_res.raise_for_status()
             search_results = search_res.json().get("query", {}).get("search", [])
 
             for result in search_results:
+                if len(results) >= MAX_RESULTS:
+                    break
                 title = result.get("title", "").replace(" ", "_")
                 if not title:
                     continue
@@ -239,12 +279,13 @@ def _search_wikipedia(query: str) -> list[dict]:
                     original  = data.get("originalimage", {})
                     thumb_url = thumbnail.get("source", "")
                     full_url  = original.get("source", thumb_url)
-                    if full_url:
-                        return [{
+                    if full_url and full_url not in seen_urls:
+                        seen_urls.add(full_url)
+                        results.append({
                             "url":       full_url,
                             "thumbnail": thumb_url or full_url,
                             "title":     data.get("title", query),
-                        }]
+                        })
                 except Exception:
                     continue
         except Exception as exc:
@@ -253,7 +294,7 @@ def _search_wikipedia(query: str) -> list[dict]:
             )
             continue
 
-    return []
+    return results
 
 
 # ---------------------------------------------------------------------------
