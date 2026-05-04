@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import base64
 import logging
+import urllib.parse
+
+import requests
 
 from services.table_service import TableService
 from services.blob_service import BlobService
@@ -84,47 +87,121 @@ def analyze_image(image_id: str, question: str) -> str:
     client = _get_client()
     deployment = _vision_deployment()
 
-    _VISION_SYSTEM_PROMPT = (
-        "You are a helpful visual assistant with knowledge of public figures, celebrities, "
-        "athletes, politicians, and well-known people worldwide.\n\n"
-        "When analyzing an image of a person:\n"
-        "- If you recognize them as a well-known public figure, identify them by name and "
-        "briefly describe who they are (profession, notable achievements).\n"
-        "- If you don't recognize them, describe what you see: their appearance, clothing, "
-        "setting, expression, approximate age, and any notable features.\n"
-        "- Be conversational and natural — avoid structured formats like 'Visible text:', "
-        "'Name clues:', etc.\n"
-        "- Never refuse to describe an image. If you're uncertain about identity, say so "
-        "and describe what you observe.\n\n"
-        "Answer the user's question directly and naturally."
+    # ── Step 1: Extract visual context clues (no identity claim required) ──
+    _CLUES_PROMPT = (
+        "Describe this image by extracting the following clues. "
+        "Be specific and factual — do NOT try to name the person.\n"
+        "Return a single line of comma-separated clues covering:\n"
+        "visible text or logos, clothing style and colour, background setting, "
+        "nationality/cultural indicators, approximate era (modern/historical), "
+        "gender, approximate age, distinctive physical features (glasses, beard, etc.), "
+        "any emblems, flags, or symbols visible.\n"
+        "Example: 'white dhoti, round glasses, thin elderly man, Indian flag, historical photo, bald'"
     )
 
-    response = client.chat.completions.create(
+    clues_resp = client.chat.completions.create(
         model=deployment,
         messages=[
-            {"role": "system", "content": _VISION_SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mime_type};base64,{b64}"},
-                    },
-                    {"type": "text", "text": question},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
+                    {"type": "text", "text": _CLUES_PROMPT},
                 ],
-            },
+            }
         ],
-        max_tokens=1000,
+        max_tokens=120,
     )
+    clues: str = clues_resp.choices[0].message.content.strip()
+    logging.info("analyze_image: clues=%r", clues)
 
-    answer: str = response.choices[0].message.content
-    logging.info(
-        "analyze_image: image_id=%s ext=%s answer_len=%d",
-        image_id,
-        ext,
-        len(answer),
-    )
+    # ── Step 2: Wikipedia lookup using the clues ───────────────────────────
+    wiki_summary = _wikipedia_lookup(clues)
+
+    # ── Step 3: Build final answer ─────────────────────────────────────────
+    if wiki_summary:
+        answer = (
+            f"Based on the visual clues in this image, this appears to be "
+            f"{wiki_summary}"
+        )
+    else:
+        # Fallback: ask GPT-4o to describe naturally without identifying
+        fallback_resp = client.chat.completions.create(
+            model=deployment,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a visual assistant. Describe the person in the image naturally: "
+                        "appearance, clothing, setting, expression. Be conversational. "
+                        "Do not use structured labels like 'Visible text:' or 'Name clues:'."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
+                        {"type": "text", "text": question},
+                    ],
+                },
+            ],
+            max_tokens=600,
+        )
+        answer = fallback_resp.choices[0].message.content.strip()
+
+    logging.info("analyze_image: image_id=%s answer_len=%d", image_id, len(answer))
     return answer
+
+
+# ---------------------------------------------------------------------------
+# Wikipedia lookup — search by visual clues, return summary of best match
+# ---------------------------------------------------------------------------
+
+_WIKI_HEADERS = {"User-Agent": "DataOrchBot/1.0 (https://azure.microsoft.com)"}
+
+
+def _wikipedia_lookup(clues: str) -> str:
+    """
+    Search Wikipedia using visual clues extracted from the image.
+    Returns a formatted string like "Mahatma Gandhi. [summary...]" or "" on failure.
+    """
+    if not clues:
+        return ""
+    try:
+        search_url = (
+            "https://en.wikipedia.org/w/api.php"
+            f"?action=query&list=search&srsearch={urllib.parse.quote(clues)}"
+            "&srlimit=3&format=json&origin=*"
+        )
+        res = requests.get(search_url, headers=_WIKI_HEADERS, timeout=8)
+        res.raise_for_status()
+        results = res.json().get("query", {}).get("search", [])
+        if not results:
+            return ""
+
+        # Try each result until we get a summary with a thumbnail (person page)
+        for hit in results:
+            title = hit.get("title", "").replace(" ", "_")
+            summary_url = (
+                f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}"
+            )
+            sr = requests.get(summary_url, headers=_WIKI_HEADERS, timeout=8)
+            if sr.status_code != 200:
+                continue
+            data = sr.json()
+            # Only use person/biography pages (they have a thumbnail)
+            if not data.get("thumbnail"):
+                continue
+            name = data.get("title", "")
+            extract = data.get("extract", "")
+            if name and extract:
+                logging.info("_wikipedia_lookup: matched %r for clues %r", name, clues[:80])
+                return f"{name}. {extract}"
+
+        return ""
+    except Exception as exc:
+        logging.warning("_wikipedia_lookup failed: %s", exc)
+        return ""
 
 
 # ---------------------------------------------------------------------------
