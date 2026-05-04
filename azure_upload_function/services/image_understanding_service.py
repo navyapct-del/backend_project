@@ -89,14 +89,16 @@ def analyze_image(image_id: str, question: str) -> str:
 
     # ── Step 1: Extract visual context clues (no identity claim required) ──
     _CLUES_PROMPT = (
-        "Describe this image by extracting the following clues. "
-        "Be specific and factual — do NOT try to name the person.\n"
-        "Return a single line of comma-separated clues covering:\n"
-        "visible text or logos, clothing style and colour, background setting, "
-        "nationality/cultural indicators, approximate era (modern/historical), "
-        "gender, approximate age, distinctive physical features (glasses, beard, etc.), "
-        "any emblems, flags, or symbols visible.\n"
-        "Example: 'white dhoti, round glasses, thin elderly man, Indian flag, historical photo, bald'"
+        "Look at this image carefully and extract specific visual clues. "
+        "Do NOT name the person. Return a single comma-separated line.\n\n"
+        "Check in this order:\n"
+        "1. VISIBLE TEXT: any name tags, captions, watermarks, banners, jerseys, badges — quote them exactly\n"
+        "2. ROLE/TITLE CLUES: uniform type, medals, insignia, official robes, sports kit, lab coat, military rank\n"
+        "3. BACKGROUND: official seals, specific flags (describe colours/symbols), logos, stadium, podium, laboratory\n"
+        "4. PHYSICAL FEATURES: specific hairstyle (e.g. 'long white hair', 'bald'), glasses type (round/rectangular), beard style, skin tone\n"
+        "5. SETTING: award ceremony, press conference, sports field, parliament, space agency, film set\n"
+        "6. ERA: historical black-and-white, 1990s, modern HD\n\n"
+        "Be as specific as possible. Example: 'white dhoti, round wire-frame glasses, bald, thin elderly Indian man, spinning wheel, historical black-and-white, Indian independence movement'"
     )
 
     clues_resp = client.chat.completions.create(
@@ -163,45 +165,70 @@ _WIKI_HEADERS = {"User-Agent": "DataOrchBot/1.0 (https://azure.microsoft.com)"}
 def _wikipedia_lookup(clues: str) -> str:
     """
     Search Wikipedia using visual clues extracted from the image.
+    Tries multiple query combinations to maximize match rate.
     Returns a formatted string like "Mahatma Gandhi. [summary...]" or "" on failure.
     """
     if not clues:
         return ""
-    try:
-        search_url = (
-            "https://en.wikipedia.org/w/api.php"
-            f"?action=query&list=search&srsearch={urllib.parse.quote(clues)}"
-            "&srlimit=3&format=json&origin=*"
-        )
-        res = requests.get(search_url, headers=_WIKI_HEADERS, timeout=8)
-        res.raise_for_status()
-        results = res.json().get("query", {}).get("search", [])
-        if not results:
-            return ""
 
-        # Try each result until we get a summary with a thumbnail (person page)
-        for hit in results:
-            title = hit.get("title", "").replace(" ", "_")
-            summary_url = (
-                f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}"
+    # Build multiple search queries from different clue combinations
+    clue_parts = [c.strip() for c in clues.split(",") if c.strip()]
+    queries = [clues]  # full clues first
+
+    if len(clue_parts) >= 3:
+        queries.append(", ".join(clue_parts[:3]))  # first 3
+        queries.append(", ".join(clue_parts[-3:]))  # last 3
+
+    # Extract role/title words and try them
+    role_words = ["president", "minister", "prime", "ceo", "founder", "scientist",
+                  "actor", "actress", "cricketer", "footballer", "astronaut", "leader",
+                  "independence", "freedom fighter", "physicist", "chemist"]
+    role_clues = [p for p in clue_parts if any(r in p.lower() for r in role_words)]
+    if role_clues:
+        queries.append(", ".join(role_clues))
+
+    # Try each query
+    for query in queries:
+        try:
+            search_url = (
+                "https://en.wikipedia.org/w/api.php"
+                f"?action=query&list=search&srsearch={urllib.parse.quote(query)}"
+                "&srlimit=5&format=json&origin=*"
             )
-            sr = requests.get(summary_url, headers=_WIKI_HEADERS, timeout=8)
-            if sr.status_code != 200:
+            res = requests.get(search_url, headers=_WIKI_HEADERS, timeout=8)
+            res.raise_for_status()
+            results = res.json().get("query", {}).get("search", [])
+            if not results:
                 continue
-            data = sr.json()
-            # Only use person/biography pages (they have a thumbnail)
-            if not data.get("thumbnail"):
-                continue
-            name = data.get("title", "")
-            extract = data.get("extract", "")
-            if name and extract:
-                logging.info("_wikipedia_lookup: matched %r for clues %r", name, clues[:80])
-                return f"{name}. {extract}"
 
-        return ""
-    except Exception as exc:
-        logging.warning("_wikipedia_lookup failed: %s", exc)
-        return ""
+            # Try each result
+            for hit in results:
+                title = hit.get("title", "").replace(" ", "_")
+                # Skip disambiguation pages
+                if "disambiguation" in title.lower():
+                    continue
+
+                summary_url = (
+                    f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}"
+                )
+                sr = requests.get(summary_url, headers=_WIKI_HEADERS, timeout=8)
+                if sr.status_code != 200:
+                    continue
+
+                data = sr.json()
+                name = data.get("title", "")
+                extract = data.get("extract", "")
+
+                # Accept any page with substantial extract (not just person pages)
+                if name and extract and len(extract) > 50:
+                    logging.info("_wikipedia_lookup: matched %r for query %r", name, query[:60])
+                    return f"{name}. {extract}"
+
+        except Exception as exc:
+            logging.warning("_wikipedia_lookup query %r failed: %s", query[:60], exc)
+            continue
+
+    return ""
 
 
 # ---------------------------------------------------------------------------
