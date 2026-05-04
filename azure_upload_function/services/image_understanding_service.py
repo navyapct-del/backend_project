@@ -87,18 +87,21 @@ def analyze_image(image_id: str, question: str) -> str:
     client = _get_client()
     deployment = _vision_deployment()
 
-    # ── Step 1: Extract visual context clues (no identity claim required) ──
+    # ── Step 1: Extract visual context clues focused on the PERSON ────────
     _CLUES_PROMPT = (
-        "Look at this image carefully and extract specific visual clues. "
-        "Do NOT name the person. Return a single comma-separated line.\n\n"
-        "Check in this order:\n"
-        "1. VISIBLE TEXT: any name tags, captions, watermarks, banners, jerseys, badges — quote them exactly\n"
-        "2. ROLE/TITLE CLUES: uniform type, medals, insignia, official robes, sports kit, lab coat, military rank\n"
-        "3. BACKGROUND: official seals, specific flags (describe colours/symbols), logos, stadium, podium, laboratory\n"
-        "4. PHYSICAL FEATURES: specific hairstyle (e.g. 'long white hair', 'bald'), glasses type (round/rectangular), beard style, skin tone\n"
-        "5. SETTING: award ceremony, press conference, sports field, parliament, space agency, film set\n"
-        "6. ERA: historical black-and-white, 1990s, modern HD\n\n"
-        "Be as specific as possible. Example: 'white dhoti, round wire-frame glasses, bald, thin elderly Indian man, spinning wheel, historical black-and-white, Indian independence movement'"
+        "Focus ONLY on the main person in this image. Ignore the background completely.\n"
+        "Extract specific clues about the person in this order:\n"
+        "1. Any visible text ON the person: name tags, jersey number, badge, title card\n"
+        "2. Their role/profession clues: military uniform + rank, scientist lab coat, "
+        "sports kit + sport type, political/official attire, religious robes\n"
+        "3. Distinctive physical features: specific hairstyle (e.g. 'bald', 'long white hair'), "
+        "glasses type (round/rectangular/none), beard/moustache style, skin tone, approximate age\n"
+        "4. Any medals, awards, or insignia ON the person\n"
+        "5. Nationality clues from their clothing or context (NOT background flags)\n\n"
+        "Return ONE comma-separated line describing only the person.\n"
+        "Example: 'elderly Indian man, bald, round wire-frame glasses, white kurta, thin build, "
+        "scientist, Bharat Ratna medal'\n"
+        "Do NOT mention background elements like flags, walls, or scenery."
     )
 
     clues_resp = client.chat.completions.create(
@@ -164,31 +167,36 @@ _WIKI_HEADERS = {"User-Agent": "DataOrchBot/1.0 (https://azure.microsoft.com)"}
 
 def _wikipedia_lookup(clues: str) -> str:
     """
-    Search Wikipedia using visual clues extracted from the image.
-    Tries multiple query combinations to maximize match rate.
-    Returns a formatted string like "Mahatma Gandhi. [summary...]" or "" on failure.
+    Search Wikipedia for a person using visual clues.
+    Appends 'person' to all queries to avoid matching objects/flags/places.
     """
     if not clues:
         return ""
 
-    # Build multiple search queries from different clue combinations
     clue_parts = [c.strip() for c in clues.split(",") if c.strip()]
-    queries = [clues]  # full clues first
 
-    if len(clue_parts) >= 3:
-        queries.append(", ".join(clue_parts[:3]))  # first 3
-        queries.append(", ".join(clue_parts[-3:]))  # last 3
+    # Always append "person" to bias results toward biographies
+    queries = [
+        clues + " person",
+        " ".join(clue_parts[:4]) + " person" if len(clue_parts) >= 4 else None,
+        " ".join(clue_parts[:3]) + " person" if len(clue_parts) >= 3 else None,
+    ]
 
-    # Extract role/title words and try them
-    role_words = ["president", "minister", "prime", "ceo", "founder", "scientist",
+    # Add role-word focused query
+    role_words = ["scientist", "president", "minister", "prime", "ceo", "founder",
                   "actor", "actress", "cricketer", "footballer", "astronaut", "leader",
-                  "independence", "freedom fighter", "physicist", "chemist"]
+                  "physicist", "freedom fighter", "revolutionary", "general", "admiral"]
     role_clues = [p for p in clue_parts if any(r in p.lower() for r in role_words)]
     if role_clues:
-        queries.append(", ".join(role_clues))
+        queries.append(", ".join(role_clues) + " person")
 
-    # Try each query
+    # Person type categories that Wikipedia uses
+    person_types = {"biography", "politician", "scientist", "actor", "cricketer",
+                    "footballer", "military", "leader", "president", "minister"}
+
     for query in queries:
+        if not query:
+            continue
         try:
             search_url = (
                 "https://en.wikipedia.org/w/api.php"
@@ -198,28 +206,42 @@ def _wikipedia_lookup(clues: str) -> str:
             res = requests.get(search_url, headers=_WIKI_HEADERS, timeout=8)
             res.raise_for_status()
             results = res.json().get("query", {}).get("search", [])
-            if not results:
-                continue
 
-            # Try each result
             for hit in results:
-                title = hit.get("title", "").replace(" ", "_")
-                # Skip disambiguation pages
-                if "disambiguation" in title.lower():
+                title = hit.get("title", "")
+                # Skip disambiguation, flag, tartan, and non-person pages
+                title_lower = title.lower()
+                if any(skip in title_lower for skip in
+                       ["disambiguation", "flag of", "tartan", "coat of arms",
+                        "national anthem", "list of"]):
                     continue
 
+                title_key = title.replace(" ", "_")
                 summary_url = (
-                    f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}"
+                    f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title_key)}"
                 )
                 sr = requests.get(summary_url, headers=_WIKI_HEADERS, timeout=8)
                 if sr.status_code != 200:
                     continue
 
                 data = sr.json()
-                name = data.get("title", "")
+                # Only accept person pages: must have a thumbnail AND
+                # description should indicate a person (born, politician, etc.)
                 extract = data.get("extract", "")
+                description = data.get("description", "").lower()
+                page_type = data.get("type", "")
 
-                # Accept any page with substantial extract (not just person pages)
+                is_person = (
+                    data.get("thumbnail") and (
+                        "born" in extract[:200].lower()
+                        or any(p in description for p in person_types)
+                        or page_type == "standard"
+                    )
+                )
+                if not is_person:
+                    continue
+
+                name = data.get("title", "")
                 if name and extract and len(extract) > 50:
                     logging.info("_wikipedia_lookup: matched %r for query %r", name, query[:60])
                     return f"{name}. {extract}"
