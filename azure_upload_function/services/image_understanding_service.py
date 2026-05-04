@@ -88,30 +88,13 @@ def analyze_image(image_id: str, question: str) -> str:
     deployment = _vision_deployment()
     image_data = {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}}
 
-    # ── Step 1: Use filename hint + GPT-4o to confirm identity ────────────
+    # ── Step 1: Use filename hint → Wikipedia person lookup ───────────────
     name_hint = _name_from_filename(filename)
     logging.info("analyze_image: name_hint=%r", name_hint)
-
     if name_hint:
-        hint_resp = client.chat.completions.create(
-            model=deployment,
-            messages=[{"role": "user", "content": [
-                image_data,
-                {"type": "text", "text": (
-                    f"The filename of this image is '{filename}', suggesting this may be '{name_hint}'. "
-                    f"Look at the image and confirm: does the person's appearance, clothing, setting, "
-                    f"or any visible text match someone named '{name_hint}'? "
-                    f"Reply with ONLY 'YES' or 'NO'."
-                )},
-            ]}],
-            max_tokens=5,
-        )
-        confirmed = hint_resp.choices[0].message.content.strip().upper().startswith("Y")
-        logging.info("analyze_image: hint confirmed=%s", confirmed)
-        if confirmed:
-            wiki = _wikipedia_lookup_by_name(name_hint, person_only=True)
-            if wiki:
-                return f"This is {wiki}"
+        wiki = _wikipedia_lookup_by_name(name_hint, person_only=True)
+        if wiki:
+            return f"This is {wiki}"
 
     # ── Step 2: Read visible text in image → Wikipedia ────────────────────
     text_resp = client.chat.completions.create(
@@ -186,8 +169,19 @@ def _name_from_filename(filename: str) -> str:
 
 def _wikipedia_lookup_by_name(name: str, person_only: bool = False) -> str:
     """Direct Wikipedia lookup by name. Returns 'Name. extract' or ''.
-    If person_only=True, only returns biography pages (must contain 'born' in extract).
+    If person_only=True, only returns biography pages (has thumbnail or 'born' in description).
     """
+    def _is_person(data: dict) -> bool:
+        if not person_only:
+            return True
+        # Person pages have a thumbnail OR description contains 'born' OR type=standard with description
+        desc = data.get("description", "").lower()
+        return bool(
+            data.get("thumbnail")
+            or "born" in desc
+            or data.get("type") == "standard" and len(desc) > 5
+        )
+
     try:
         title = name.replace(" ", "_")
         res = requests.get(
@@ -198,11 +192,8 @@ def _wikipedia_lookup_by_name(name: str, person_only: bool = False) -> str:
             data = res.json()
             extract = data.get("extract", "")
             found = data.get("title", name)
-            if extract and len(extract) > 50:
-                if person_only and "born" not in extract[:300].lower():
-                    pass  # not a person page, fall through to search
-                else:
-                    return f"{found}. {extract}"
+            if extract and len(extract) > 50 and _is_person(data):
+                return f"{found}. {extract}"
         # Search fallback
         res = requests.get(
             f"https://en.wikipedia.org/w/api.php?action=query&list=search"
@@ -220,10 +211,7 @@ def _wikipedia_lookup_by_name(name: str, person_only: bool = False) -> str:
             data = sr.json()
             extract = data.get("extract", "")
             found = data.get("title", "")
-            is_person = data.get("thumbnail") and "born" in extract[:300].lower()
-            if person_only and not is_person:
-                continue
-            if extract and len(extract) > 50:
+            if extract and len(extract) > 50 and _is_person(data):
                 logging.info("_wikipedia_lookup_by_name: found %r", found)
                 return f"{found}. {extract}"
     except Exception as exc:
