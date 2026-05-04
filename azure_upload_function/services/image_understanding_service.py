@@ -89,15 +89,25 @@ def analyze_image(image_id: str, question: str) -> str:
 
     image_data = {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}}
 
-    # ── Step 1: Extract any visible text / name from the image ────────────
+    # ── Step 1: Azure Computer Vision celebrity detection ─────────────────
+    celebrity_name = _detect_celebrity(image_bytes)
+    logging.info("analyze_image: celebrity_name=%r", celebrity_name)
+
+    if celebrity_name:
+        wiki = _wikipedia_lookup_by_name(celebrity_name)
+        if wiki:
+            return f"This is {wiki}"
+        return f"This is {celebrity_name}."
+
+    # ── Step 2: Read any visible text and search Wikipedia ────────────────
     text_resp = client.chat.completions.create(
         model=deployment,
         messages=[{"role": "user", "content": [
             image_data,
             {"type": "text", "text": (
                 "Read ALL visible text in this image exactly as written: "
-                "captions, watermarks, name tags, banners, jersey names, title cards, subtitles. "
-                "Return only the text you see, or 'NONE' if there is no text."
+                "captions, watermarks, name tags, banners, jersey names, title cards. "
+                "Return only the text, or 'NONE' if there is no text."
             )},
         ]}],
         max_tokens=60,
@@ -105,26 +115,19 @@ def analyze_image(image_id: str, question: str) -> str:
     visible_text = text_resp.choices[0].message.content.strip()
     logging.info("analyze_image: visible_text=%r", visible_text)
 
-    # ── Step 2: If text found, search Wikipedia for the name ──────────────
     if visible_text and visible_text.upper() != "NONE" and len(visible_text) > 2:
         wiki = _wikipedia_lookup_by_name(visible_text)
         if wiki:
             return f"This is {wiki}"
 
-    # ── Step 3: Ask GPT-4o to describe the person in detail ───────────────
-    # GPT-4o cannot identify faces but can describe appearance, clothing,
-    # setting, and any contextual clues that help the user understand the image.
+    # ── Step 3: Describe the person in detail ─────────────────────────────
     desc_resp = client.chat.completions.create(
         model=deployment,
         messages=[
             {"role": "system", "content": (
-                "You are a visual assistant. When shown an image of a person:\n"
-                "1. Describe their physical appearance in detail: age, build, hair, facial features\n"
-                "2. Describe their clothing and any visible accessories or medals\n"
-                "3. Describe the setting and background\n"
-                "4. Note any cultural, professional, or historical context clues\n"
-                "5. If the image has any text, captions, or labels, mention them\n"
-                "Be specific and detailed. Do NOT say 'I cannot identify' — just describe what you see."
+                "Describe the person in the image in detail: appearance, clothing, "
+                "approximate age, expression, setting, and any cultural or professional context clues. "
+                "Be specific. Do not say 'I cannot identify'."
             )},
             {"role": "user", "content": [image_data, {"type": "text", "text": question}]},
         ],
@@ -140,6 +143,37 @@ def analyze_image(image_id: str, question: str) -> str:
 # ---------------------------------------------------------------------------
 
 _WIKI_HEADERS = {"User-Agent": "DataOrchBot/1.0 (https://azure.microsoft.com)"}
+
+
+def _detect_celebrity(image_bytes: bytes) -> str:
+    """
+    Use Azure Computer Vision domain-specific celebrity model to identify the person.
+    Returns the celebrity name string, or "" if not detected / service unavailable.
+    """
+    import os
+    endpoint = os.environ.get("AZURE_VISION_ENDPOINT", "").rstrip("/")
+    key = os.environ.get("AZURE_VISION_KEY", "")
+    if not endpoint or not key:
+        return ""
+    try:
+        url = f"{endpoint}/vision/v3.2/models/celebrities/analyze"
+        res = requests.post(
+            url,
+            headers={"Ocp-Apim-Subscription-Key": key, "Content-Type": "application/octet-stream"},
+            data=image_bytes,
+            timeout=10,
+        )
+        res.raise_for_status()
+        celebrities = res.json().get("result", {}).get("celebrities", [])
+        if celebrities:
+            # Return highest-confidence match
+            best = max(celebrities, key=lambda c: c.get("confidence", 0))
+            if best.get("confidence", 0) >= 0.7:
+                logging.info("_detect_celebrity: %r confidence=%.2f", best["name"], best["confidence"])
+                return best["name"]
+    except Exception as exc:
+        logging.warning("_detect_celebrity failed: %s", exc)
+    return ""
 
 
 def _wikipedia_lookup_by_name(name: str) -> str:
