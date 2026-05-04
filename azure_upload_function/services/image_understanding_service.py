@@ -95,7 +95,7 @@ def analyze_image(image_id: str, question: str) -> str:
     name_from_file = _name_from_filename(filename)
     logging.info("analyze_image: name_from_file=%r", name_from_file)
     if name_from_file:
-        wiki = _wikipedia_lookup_by_name(name_from_file)
+        wiki = _wikipedia_lookup_by_name(name_from_file, person_only=True)
         if wiki:
             return f"This is {wiki}"
 
@@ -174,8 +174,10 @@ def _name_from_filename(filename: str) -> str:
     return candidate
 
 
-def _wikipedia_lookup_by_name(name: str) -> str:
-    """Direct Wikipedia lookup by name. Returns 'Name. extract' or ''."""
+def _wikipedia_lookup_by_name(name: str, person_only: bool = False) -> str:
+    """Direct Wikipedia lookup by name. Returns 'Name. extract' or ''.
+    If person_only=True, only returns biography pages (must contain 'born' in extract).
+    """
     try:
         title = name.replace(" ", "_")
         res = requests.get(
@@ -187,11 +189,14 @@ def _wikipedia_lookup_by_name(name: str) -> str:
             extract = data.get("extract", "")
             found = data.get("title", name)
             if extract and len(extract) > 50:
-                return f"{found}. {extract}"
+                if person_only and "born" not in extract[:300].lower():
+                    pass  # not a person page, fall through to search
+                else:
+                    return f"{found}. {extract}"
         # Search fallback
         res = requests.get(
             f"https://en.wikipedia.org/w/api.php?action=query&list=search"
-            f"&srsearch={urllib.parse.quote(name)}&srlimit=3&format=json&origin=*",
+            f"&srsearch={urllib.parse.quote(name)}&srlimit=5&format=json&origin=*",
             headers=_WIKI_HEADERS, timeout=8
         )
         for hit in res.json().get("query", {}).get("search", []):
@@ -205,7 +210,10 @@ def _wikipedia_lookup_by_name(name: str) -> str:
             data = sr.json()
             extract = data.get("extract", "")
             found = data.get("title", "")
-            if data.get("thumbnail") and extract and len(extract) > 50:
+            is_person = data.get("thumbnail") and "born" in extract[:300].lower()
+            if person_only and not is_person:
+                continue
+            if extract and len(extract) > 50:
                 logging.info("_wikipedia_lookup_by_name: found %r", found)
                 return f"{found}. {extract}"
     except Exception as exc:
