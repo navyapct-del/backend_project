@@ -830,12 +830,14 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
     user_query      = req.params.get("q", "")
     filename_filter = req.params.get("filename", "")
     doc_ids         = None
+    history         = None
     if not user_query:
         try:
             body            = req.get_json()
             user_query      = body.get("q", "")
             filename_filter = body.get("filename", filename_filter)
             doc_ids         = body.get("doc_ids") or None
+            history         = body.get("history") or None
         except Exception:
             pass
 
@@ -876,6 +878,7 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
             use_hyde        = True,
             use_compression = True,
             doc_ids         = doc_ids,
+            history         = history,
         )
 
         resp_type    = result.get("type", "text")

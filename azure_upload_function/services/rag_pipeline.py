@@ -332,6 +332,7 @@ def grounded_generate(
     query: str,
     chunks: list[dict],
     response_format: Literal["text", "table", "chart", "auto"] = "auto",
+    history: list[dict] | None = None,
 ) -> dict:
     """
     Generate a grounded answer from compressed, relevant chunks.
@@ -422,13 +423,21 @@ Question: {query}
 {format_instructions}"""
 
     try:
+        # Build messages: system + optional history (last 6 turns) + current user prompt
+        messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
+        if history:
+            # Include last 6 turns (3 user + 3 assistant) to stay within token budget
+            for turn in history[-6:]:
+                role    = turn.get("role", "user")
+                content = turn.get("content", "")
+                if role in ("user", "assistant") and content:
+                    messages.append({"role": role, "content": content[:800]})
+        messages.append({"role": "user", "content": user_prompt})
+
         resp = _get_client().chat.completions.create(
             model    = _deployment(),
-            messages = [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user",   "content": user_prompt},
-            ],
-            temperature = 0.0,    # deterministic for consistency
+            messages = messages,
+            temperature = 0.0,
             max_tokens  = 2500,
         )
         raw = resp.choices[0].message.content.strip()
@@ -608,6 +617,7 @@ def run_rag_pipeline(
     use_hyde:        bool = True,
     use_compression: bool = True,
     doc_ids:         list[str] | None = None,
+    history:         list[dict] | None = None,
 ) -> dict:
     """
     Full advanced RAG pipeline entry point.
@@ -626,7 +636,25 @@ def run_rag_pipeline(
     if not query or not query.strip():
         return {"type": "text", "answer": "No question provided."}
 
-    # ── Step 1: Multi-query retrieval with HyDE ───────────────────────────
+    import time as _time
+
+    # ── Step 1: Build cache key — includes doc_ids so different selections
+    #    never share a cached answer (FIX: was missing doc_ids before)
+    doc_ids_key = "|".join(sorted(doc_ids)) if doc_ids else ""
+    cache_key = hashlib.md5(
+        (query + "|" + filename_filter + "|" + uploaded_by + "|" + session_id + "|" + doc_ids_key).encode()
+    ).hexdigest()
+
+    # ── Step 2: Check cache early ─────────────────────────────────────────
+    cached = _pipeline_cache.get(cache_key)
+    if cached:
+        result, ts = cached
+        if _time.time() - ts < _CACHE_TTL_SECS:
+            logging.info("run_rag_pipeline: cache hit")
+            return result
+        del _pipeline_cache[cache_key]
+
+    # ── Step 3: Multi-query retrieval with HyDE ───────────────────────────
     chunks = multi_query_retrieve(
         query           = query,
         top_k           = top_k,
@@ -642,98 +670,90 @@ def run_rag_pipeline(
             "answer": "No relevant information found in this document.",
         }
 
-    # ── Step 2: Build cache key (includes session_id to isolate per-session results) ──
-    import time as _time
-    cache_key = hashlib.md5((query + "|" + filename_filter + "|" + uploaded_by + "|" + session_id).encode()).hexdigest()
-
-    # ── Step 3: Check for structured data (for analytical queries) ────────
-    # CRITICAL: match structured data to the query topic, not just "first with data"
+    # ── Step 4: Collect structured data from ALL relevant docs ────────────
+    # FIX: previously only picked the single best-scoring doc.
+    # Now we collect ALL docs that have structured data and score > 0,
+    # merge them into one DataFrame with a _source column for cross-doc queries.
     table_svc = TableService()
-    stored_sd = None
-
     q_lower   = query.lower()
     q_words   = set(w.strip(".,!?;:()") for w in q_lower.split() if len(w) >= 3)
 
+    def _stem(w: str) -> str:
+        if w.endswith("ing") and len(w) > 5: return w[:-3]
+        if w.endswith("ies") and len(w) > 4: return w[:-3] + "y"
+        if w.endswith("es")  and len(w) > 4: return w[:-2]
+        if w.endswith("s")   and len(w) > 3: return w[:-1]
+        return w
+
+    stemmed_q_words = {_stem(w) for w in q_words} | q_words
+
     def _sd_relevance_score(sd: dict, filename: str) -> int:
-        """Score how relevant a document's structured data is to the query."""
         score = 0
-        # Column name overlap with query words (stemmed: strip trailing s/es/ing)
         sd_columns = sd.get("columns", [])
         if not sd_columns and sd.get("sheets"):
             for sheet_data in sd["sheets"].values():
                 sd_columns = sheet_data.get("columns", [])
                 if sd_columns:
                     break
-
-        def _stem(w: str) -> str:
-            """Minimal suffix stripping for English plurals/gerunds."""
-            if w.endswith("ing") and len(w) > 5:
-                return w[:-3]
-            if w.endswith("ies") and len(w) > 4:
-                return w[:-3] + "y"
-            if w.endswith("es") and len(w) > 4:
-                return w[:-2]
-            if w.endswith("s") and len(w) > 3:
-                return w[:-1]
-            return w
-
-        stemmed_q_words = {_stem(w) for w in q_words} | q_words
-
         for col in sd_columns:
             col_lower = col.lower().replace("_", " ").replace("-", " ")
             col_words = set(col_lower.split())
             stemmed_col_words = {_stem(w) for w in col_words} | col_words
             for qw in stemmed_q_words:
-                # Substring match (stemmed)
                 if qw in col_lower or any(qw in cw or cw in qw for cw in stemmed_col_words):
                     score += 3
                     break
-        # Filename overlap with query words (stemmed)
         fname_lower = filename.lower().replace("_", " ").replace("-", " ")
         for qw in stemmed_q_words:
             if qw in fname_lower:
                 score += 5
                 break
-        # Chart/aggregation keywords get a base score only if structured data has numeric columns
         chart_agg_kw = {"chart", "graph", "plot", "total", "sum", "average",
                         "count", "max", "min", "distribution", "breakdown"}
-        numeric_cols = [c for c in sd_columns if any(
-            isinstance(v, (int, float)) for v in [] # checked at query time
-        )]
         if any(k in q_lower for k in chart_agg_kw) and sd_columns:
             score += 1
         return score
 
-    # Score all retrieved documents' structured data and pick the best match
-    best_score = -1
+    # Deduplicate chunks by doc_id so we fetch structured data once per doc
+    seen_doc_ids: set[str] = set()
+    candidate_docs: list[tuple[str, str, str]] = []  # (doc_id, filename, chunk_doc_id)
     for chunk in chunks:
-        fname = chunk.get("filename", "")
+        fname  = chunk.get("filename", "")
+        doc_id = chunk.get("doc_id", "")
         if not fname:
             continue
-        sd = table_svc.get_structured_data(fname, session_id=session_id)
+        dedup_key = doc_id or fname
+        if dedup_key in seen_doc_ids:
+            continue
+        seen_doc_ids.add(dedup_key)
+        candidate_docs.append((doc_id, fname))
+
+    # Collect all docs with relevant structured data
+    relevant_sds: list[tuple[str, dict, int]] = []  # (filename, sd, score)
+    for doc_id, fname in candidate_docs:
+        # FIX: pass doc_id to get_structured_data to prevent filename collision
+        sd = table_svc.get_structured_data(fname, session_id=session_id, doc_id=doc_id)
         if not sd:
             continue
         score = _sd_relevance_score(sd, fname)
-        logging.info("run_rag_pipeline: structured data relevance '%s' score=%d", fname, score)
-        if score > best_score:
-            best_score = score
-            stored_sd  = sd
-            logging.info("run_rag_pipeline: selected structured data from '%s' (score=%d)", fname, score)
+        logging.info("run_rag_pipeline: structured data '%s' (doc_id=%s) score=%d", fname, doc_id, score)
+        if score > 0:
+            relevant_sds.append((fname, sd, score))
 
-    # Only use structured data if it has meaningful relevance to the query
-    if best_score <= 0:
-        stored_sd = None
-        logging.info("run_rag_pipeline: no relevant structured data found — using prose RAG")
-
-    # ── Step 4b: Check cache (after structured data selection so key is stable) ──
-    cached = _pipeline_cache.get(cache_key)
-    if cached:
-        result, ts = cached
-        if _time.time() - ts < _CACHE_TTL_SECS:
-            logging.info("run_rag_pipeline: cache hit")
-            return result
+    # Build merged structured data if we have any relevant docs
+    stored_sd: dict | None = None
+    if relevant_sds:
+        if len(relevant_sds) == 1:
+            # Single doc — use as-is (no _source column needed, preserves existing behaviour)
+            stored_sd = relevant_sds[0][1]
+            logging.info("run_rag_pipeline: single structured doc '%s'", relevant_sds[0][0])
         else:
-            del _pipeline_cache[cache_key]  # expired
+            # Multiple docs — merge into one with _source column (FIX: was silently dropping all but best)
+            stored_sd = _merge_structured_data(relevant_sds)
+            logging.info("run_rag_pipeline: merged %d structured docs", len(relevant_sds))
+
+    if not relevant_sds:
+        logging.info("run_rag_pipeline: no relevant structured data — using prose RAG")
 
     # ── Step 5: Intent classification ────────────────────────────────────
     intent = classify_intent(query, has_structured_data=stored_sd is not None)
@@ -742,18 +762,18 @@ def run_rag_pipeline(
     # ── Step 6: Route to structured engine or prose RAG ──────────────────
     if intent == "structured" and stored_sd:
         from services.query_engine import generate_plan, execute_plan, structured_to_df
-        import pandas as pd
-        import json as _json
 
         def _run_engine_local(query: str, structured: dict) -> dict | None:
             try:
                 df = structured_to_df(structured)
                 if df.empty:
                     return None
-                df      = df.drop(columns=[c for c in df.columns if c.startswith("_")], errors="ignore")
-                cols    = list(df.columns)
-                plan    = generate_plan(query, cols)
-                result  = execute_plan(df, plan)
+                # Keep _source column if present (cross-doc merge marker)
+                drop_cols = [c for c in df.columns if c.startswith("_") and c != "_source"]
+                df = df.drop(columns=drop_cols, errors="ignore")
+                cols   = list(df.columns)
+                plan   = generate_plan(query, cols)
+                result = execute_plan(df, plan)
                 return result
             except Exception as exc:
                 logging.warning("_run_engine_local failed: %s", exc)
@@ -763,24 +783,23 @@ def run_rag_pipeline(
         if engine_result and engine_result.get("type") != "error":
             rows = engine_result.get("rows", [])
             if rows or engine_result.get("type") == "text":
-                # Promote to chart with correct type if query has chart intent
                 if engine_result.get("type") != "chart":
                     from services.query_engine import promote_to_chart
                     try:
                         df   = structured_to_df(stored_sd)
+                        drop_cols = [c for c in df.columns if c.startswith("_") and c != "_source"]
+                        df   = df.drop(columns=drop_cols, errors="ignore")
                         cols = list(df.columns)
                         plan = generate_plan(query, cols)
                         if any(k in query.lower() for k in _CHART_KEYWORDS) and plan.get("group_by"):
                             engine_result = promote_to_chart(engine_result, query)
                     except Exception:
                         pass
-                # Clean chart data if applicable (Shape A: labels/values)
                 if engine_result.get("type") == "chart" and engine_result.get("labels"):
                     engine_result = _clean_chart_data(engine_result, user_query=query)
                 result = {k: v for k, v in engine_result.items() if k != "sources"}
                 _cache_result(cache_key, result)
                 return result
-        # Fall through to prose RAG if engine fails
         logging.info("run_rag_pipeline: structured engine failed — falling back to prose RAG")
 
     # ── Step 7: Contextual compression ───────────────────────────────────
@@ -789,8 +808,7 @@ def run_rag_pipeline(
     else:
         compressed_chunks = chunks
 
-    # ── Step 8: Grounded generation ───────────────────────────────────────
-    q_lower = query.lower()
+    # ── Step 8: Grounded generation — inject history for multi-turn context ──
     if intent == "hybrid":
         response_format = "table"
     elif any(k in q_lower for k in _CHART_KEYWORDS):
@@ -804,11 +822,53 @@ def run_rag_pipeline(
         query           = query,
         chunks          = compressed_chunks,
         response_format = response_format,
+        history         = history,
     )
 
     # ── Step 9: Cache and return ──────────────────────────────────────────
     _cache_result(cache_key, result)
     return result
+
+
+def _merge_structured_data(docs: list[tuple[str, dict, int]]) -> dict:
+    """
+    Merge structured data from multiple documents into a single dict.
+    Adds a '_source' column with the filename so the query engine and user
+    can tell which row came from which document.
+
+    docs: list of (filename, structured_data, score) — sorted by score desc.
+    Returns a merged structured_data dict with 'rows' and 'columns'.
+    """
+    from services.query_engine import structured_to_df
+    import pandas as pd
+
+    docs_sorted = sorted(docs, key=lambda x: x[2], reverse=True)
+    frames = []
+    for fname, sd, _ in docs_sorted:
+        try:
+            df = structured_to_df(sd)
+            if df.empty:
+                continue
+            # Drop internal columns except keep schema markers out
+            df = df.drop(columns=[c for c in df.columns if c.startswith("_")], errors="ignore")
+            df["_source"] = fname
+            frames.append(df)
+        except Exception as exc:
+            logging.warning("_merge_structured_data: failed to convert '%s': %s", fname, exc)
+
+    if not frames:
+        return {}
+
+    merged = pd.concat(frames, ignore_index=True, sort=False)
+    # Fill NaN with None for JSON serialisation
+    merged = merged.where(pd.notnull(merged), None)
+
+    return {
+        "rows":    merged.to_dict(orient="records"),
+        "columns": list(merged.columns),
+        "_merged": True,
+        "_sources": [f for f, _, _ in docs_sorted],
+    }
 
 
 def _cache_result(key: str, result: dict) -> None:

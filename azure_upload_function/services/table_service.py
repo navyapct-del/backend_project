@@ -163,12 +163,15 @@ class TableService:
             logging.exception("Table update failed for filename=%s", filename)
             raise
 
-    def get_structured_data(self, filename: str, session_id: str = "") -> dict | None:
+    def get_structured_data(self, filename: str, session_id: str = "", doc_id: str = "") -> dict | None:
         """
         Retrieve structured data — downloads from Blob Storage if URL exists,
         falls back to inline field. Returns None if stale or missing.
         When multiple entities share the same filename (e.g. temp uploads from
-        different sessions), prefer the one matching session_id, then the most recent.
+        different sessions), prefer the one matching doc_id, then session_id,
+        then the most recent.
+        doc_id: if provided, filters to only entities with this doc_id (prevents
+                filename collision between different users' documents).
         """
         try:
             entities = list(self._client.query_entities(
@@ -176,6 +179,12 @@ class TableService:
             ))
             if not entities:
                 return None
+
+            # FIX: filter by doc_id first to prevent filename collision across users
+            if doc_id:
+                doc_id_match = [e for e in entities if e.get("RowKey", "") == doc_id or e.get("doc_id", "") == doc_id]
+                if doc_id_match:
+                    entities = doc_id_match
 
             # Prefer entity matching session_id (temp uploads), then most recent
             if session_id:
