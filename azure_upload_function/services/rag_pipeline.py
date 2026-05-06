@@ -709,8 +709,12 @@ def run_rag_pipeline(
                 score += 5
                 break
         chart_agg_kw = {"chart", "graph", "plot", "total", "sum", "average",
-                        "count", "max", "min", "distribution", "breakdown"}
+                        "count", "max", "min", "distribution", "breakdown",
+                        "how many", "number of", "how much", "avg", "mean"}
         if any(k in q_lower for k in chart_agg_kw) and sd_columns:
+            score += 1
+        # Any structured intent keyword → give base score so structured engine is tried
+        if any(k in q_lower for k in _STRUCTURED_KEYWORDS) and sd_columns:
             score += 1
         return score
 
