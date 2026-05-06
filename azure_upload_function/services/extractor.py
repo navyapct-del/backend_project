@@ -445,12 +445,32 @@ def _ocr(file_bytes: bytes, filename: str) -> str:
     return text
 
 
+def _sanitize_rows(rows: list[dict]) -> list[dict]:
+    """Convert non-JSON-serializable types (Timestamp, date, NaT, NaN) to safe values."""
+    import pandas as pd
+    import math
+    clean = []
+    for row in rows:
+        new_row = {}
+        for k, v in row.items():
+            if isinstance(v, pd.Timestamp):
+                new_row[k] = v.isoformat() if not pd.isnull(v) else None
+            elif isinstance(v, float) and math.isnan(v):
+                new_row[k] = None
+            elif hasattr(v, 'isoformat'):  # date, datetime
+                new_row[k] = v.isoformat()
+            else:
+                new_row[k] = v
+        clean.append(new_row)
+    return clean
+
+
 def _csv_to_text_and_struct(file_bytes: bytes) -> tuple[str, dict]:
     from services.cleaner import read_csv_clean
     df = read_csv_clean(file_bytes, source_label="csv")
     return df.to_string(index=False), {
         "columns": list(df.columns),
-        "rows":    df.to_dict(orient="records"),
+        "rows":    _sanitize_rows(df.to_dict(orient="records")),
     }
 
 
@@ -469,13 +489,14 @@ def _excel_to_text_and_struct(file_bytes: bytes) -> tuple[str, dict]:
             continue
         parts.append(f"Sheet: {sheet}\n{df.to_string(index=False)}")
         sheet_cols = list(df.columns)
+        sheet_rows = _sanitize_rows(df.to_dict(orient="records"))
         sheets[sheet] = {
             "columns": sheet_cols,
-            "rows":    df.to_dict(orient="records"),
+            "rows":    sheet_rows,
         }
         if not columns:
             columns = sheet_cols
-        for record in df.to_dict(orient="records"):
+        for record in sheet_rows:
             row = {str(k): v for k, v in record.items()}
             row["_sheet"] = sheet
             all_rows.append(row)
