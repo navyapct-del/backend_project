@@ -883,8 +883,18 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
 
         resp_type    = result.get("type", "text")
         chart_config = result.get("chart_config")
-        rows         = result.get("rows", [])
+        rows         = result.get("rows", []) or result.get("data", [])  # data is alias for rows
         columns      = result.get("columns", [])
+
+        # If query has no explicit chart keyword, downgrade chart → table
+        _explicit_chart = any(k in user_query.lower() for k in {
+            "chart", "graph", "plot", "visualize", "visualise",
+            "bar chart", "line chart", "pie chart", "scatter", "histogram"
+        })
+        if resp_type == "chart" and not _explicit_chart and rows:
+            resp_type    = "table"
+            chart_config = None
+            columns      = columns or (list(rows[0].keys()) if rows else [])
 
         logging.info("query: type=%s elapsed=%.3fs", resp_type, time.time() - t0)
 
