@@ -82,9 +82,23 @@ def classify_intent(query: str, has_structured_data: bool) -> IntentType:
     """
     q = query.lower()
 
+    # Word-boundary check for short keywords that are substrings of prose words
+    # e.g. "sum" matches "summarize", "avg" matches "average" in wrong context
+    import re as _re
+    def _has_kw(kw: str) -> bool:
+        if len(kw) <= 4:
+            return bool(_re.search(r'\b' + _re.escape(kw) + r'\b', q))
+        return kw in q
+
     has_chart_intent      = any(k in q for k in _CHART_KEYWORDS)
-    has_structured_intent = any(k in q for k in _STRUCTURED_KEYWORDS)
+    has_structured_intent = any(_has_kw(k) for k in _STRUCTURED_KEYWORDS)
     has_table_intent      = any(k in q for k in _TABLE_KEYWORDS)
+
+    # Prose-first queries — never route to structured engine
+    prose_triggers = {"summarize", "summary", "explain", "describe", "what is", "who is",
+                      "tell me about", "overview", "introduction", "background"}
+    if any(t in q for t in prose_triggers):
+        return "prose"
 
     if not has_structured_data:
         return "prose"
