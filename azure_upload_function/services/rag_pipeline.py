@@ -159,21 +159,12 @@ def multi_query_retrieve(
 ) -> list[dict]:
     """
     Retrieve chunks using multiple query variants + HyDE for better recall.
-
-    Strategy:
-      1. Generate query variants + HyDE passage
-      2. Embed each variant
-      3. Run hybrid search for each
-      4. Merge results, deduplicate by chunk id
-      5. Re-rank merged set by best score per chunk
-      6. Return top_k
-
-    Falls back to single-query retrieval if variant generation fails.
+    When doc_ids are provided with multiple docs, guarantees at least 2 chunks
+    per document so cross-doc queries always have context from each source.
     """
     from services.openai_service import generate_embedding
     from services.search_service import vector_search
 
-    # Generate variants (includes HyDE if enabled)
     if use_hyde:
         queries = generate_query_variants(query)
     else:
@@ -216,7 +207,34 @@ def multi_query_retrieve(
 
     # Sort merged results by score, return top_k
     merged = sorted(seen_ids.values(), key=lambda x: x["score"], reverse=True)
-    result = merged[:top_k]
+
+    # When multiple doc_ids selected, guarantee at least 2 chunks per doc
+    # so cross-doc queries (summarize both, compare) always have context from each source
+    if doc_ids and len(doc_ids) > 1:
+        per_doc: dict[str, list] = {}
+        for chunk in merged:
+            did = chunk.get("doc_id", "")
+            per_doc.setdefault(did, []).append(chunk)
+
+        guaranteed: list[dict] = []
+        for did in doc_ids:
+            guaranteed.extend(per_doc.get(did, [])[:2])  # top 2 per doc
+
+        # Fill remaining slots with highest-scoring chunks not already included
+        guaranteed_ids = {c["id"] for c in guaranteed}
+        for chunk in merged:
+            if len(guaranteed) >= top_k:
+                break
+            if chunk["id"] not in guaranteed_ids:
+                guaranteed.append(chunk)
+                guaranteed_ids.add(chunk["id"])
+
+        result = guaranteed[:top_k + len(doc_ids)]  # allow slightly more for multi-doc
+        logging.info("multi_query_retrieve: multi-doc guarantee → %d chunks across %d docs",
+                     len(result), len(doc_ids))
+    else:
+        result = merged[:top_k]
+
     logging.info("multi_query_retrieve: %d unique chunks from %d queries → returning %d",
                  len(seen_ids), len(queries), len(result))
     return result
