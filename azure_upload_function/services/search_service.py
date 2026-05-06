@@ -289,16 +289,18 @@ def vector_search(
     # If uploaded_by filter returned nothing, the index may not have that field populated
     # (e.g. documents uploaded before backfill). Retry without uploaded_by but KEEP
     # doc_ids filter so we never leak other users' documents.
-    if not results and uploaded_by and not filename_filter:
+    if not results and uploaded_by:
         logging.warning(
             "vector_search: uploaded_by filter returned no results — retrying without uploaded_by"
         )
         if doc_ids and len(doc_ids) > 0:
-            # Keep the doc_ids filter — only drop the uploaded_by part
-            safe_ids   = ",".join(d.replace("'", "''") for d in doc_ids)
+            safe_ids = ",".join(d.replace("'", "''") for d in doc_ids)
             fallback_kwargs = {**search_kwargs, "filter": f"search.in(doc_id, '{safe_ids}', ',')"}
+        elif filename_filter:
+            # Temp uploads (SingleFileSathi) index with uploaded_by="" — keep filename filter only
+            fn = filename_filter.replace("'", "''")
+            fallback_kwargs = {**search_kwargs, "filter": f"filename eq '{fn}'"}
         else:
-            # No doc_ids — drop filter entirely (original behaviour for single-doc queries)
             fallback_kwargs = {k: v for k, v in search_kwargs.items() if k != "filter"}
         results = _run_search(fallback_kwargs)
 
