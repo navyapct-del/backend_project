@@ -300,6 +300,31 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
                 json.dumps({"error": f"File too large. Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB."}),
                 status_code=413, mimetype="application/json")
 
+        # ── Fast path: temp image uploads skip OCR + embedding ────────────
+        # ChatInfoSage uploads images as temp=true; analyze_image() reads the
+        # blob directly via Azure OpenAI vision, so OCR/embedding are not needed.
+        TEMP_IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "webp"}
+        if temp_flag and file_ext in TEMP_IMAGE_EXTS:
+            blob_svc = BlobService()
+            custom_blob_name = f"temp/{session_id}/{uuid.uuid4().hex}_{filename}"
+            blob_url = blob_svc.upload(filename, file_bytes,
+                                       file.content_type or "image/jpeg",
+                                       blob_name=custom_blob_name)
+            logging.info("Temp image fast-path blob uploaded: %s", blob_url)
+
+            table_svc = TableService()
+            record_id = table_svc.insert_entity(filename, blob_url, description, tags_input,
+                                                temp=temp_flag, session_id=session_id,
+                                                uploaded_by=uploaded_by)
+            # Mark completed immediately — no OCR/embedding needed
+            table_svc.mark_completed(record_id)
+            logging.info("Temp image fast-path complete: id=%s", record_id)
+            return func.HttpResponse(
+                json.dumps({"id": record_id, "filename": filename,
+                            "blob_url": blob_url, "message": "Upload successful."}),
+                status_code=201, mimetype="application/json")
+
+
         # ── 1. Blob Storage ───────────────────────────────────────────────
         # ── 1. Blob Storage ───────────────────────────────────────────────
         # Check for duplicate filename (non-temp uploads only)
@@ -1881,3 +1906,4 @@ def share_chat_alias(req: func.HttpRequest) -> func.HttpResponse:
         json.dumps({"shareUrl": share_url, "sessionId": session_id}),
         status_code=200, mimetype="application/json"
     )
+
