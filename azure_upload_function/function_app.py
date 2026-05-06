@@ -1820,7 +1820,7 @@ def share_chat(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     # Build a shareable link using the frontend base URL env var (falls back to a placeholder)
-    frontend_url = os.environ.get("FRONTEND_URL", "https://agreeable-glacier-0b749ee0f.7.azurestaticapps.net").rstrip("/")
+    frontend_url = os.environ.get("FRONTEND_URL", "https://icy-island-094f9fb0f.7.azurestaticapps.net").rstrip("/")
     share_url = f"{frontend_url}/chat/{session_id}?userId={user_id}"
     return func.HttpResponse(
         json.dumps({"shareUrl": share_url, "sessionId": session_id}),
@@ -1855,6 +1855,39 @@ def sync_chat(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as exc:
         logging.exception("syncChat error")
         return func.HttpResponse(json.dumps({"error": str(exc)}), status_code=500, mimetype="application/json")
+
+
+# ---------------------------------------------------------------------------
+# GET /chatSession/{sessionId}/shared?userId= — public shared chat endpoint
+# No Ocp-Apim-Subscription-Key required; reads Blob then falls back to Table.
+# ---------------------------------------------------------------------------
+
+@app.route(route="chatSession/{sessionId}/shared", methods=["GET"])
+def get_shared_chat_session(req: func.HttpRequest) -> func.HttpResponse:
+    """Public endpoint — no userId required beyond the query param in the share URL."""
+    session_id = req.route_params.get("sessionId", "").strip()
+    user_id    = (req.params.get("userId") or "").strip()
+    logging.info("GET /chatSession/%s/shared", session_id)
+    if not session_id or not user_id:
+        return func.HttpResponse(
+            json.dumps({"error": "sessionId and userId are required"}),
+            status_code=400, mimetype="application/json")
+    try:
+        data = get_chat_file_from_blob(user_id, session_id)
+        if data:
+            messages = data.get("messages", [])
+        else:
+            # Fallback to Table Storage
+            raw      = get_messages_from_table(user_id, session_id)
+            messages = [{"role": m["role"], "content": m["message"], "timestamp": m["createdAt"]} for m in raw]
+        return func.HttpResponse(
+            json.dumps({"sessionId": session_id, "messages": messages}),
+            status_code=200, mimetype="application/json")
+    except Exception as exc:
+        logging.exception("getSharedChatSession error")
+        return func.HttpResponse(
+            json.dumps({"error": str(exc)}),
+            status_code=500, mimetype="application/json")
 
 
 # ---------------------------------------------------------------------------
@@ -1903,7 +1936,7 @@ def share_chat_alias(req: func.HttpRequest) -> func.HttpResponse:
             status_code=400, mimetype="application/json"
         )
 
-    frontend_url = os.environ.get("FRONTEND_URL", "https://agreeable-glacier-0b749ee0f.7.azurestaticapps.net").rstrip("/")
+    frontend_url = os.environ.get("FRONTEND_URL", "https://icy-island-094f9fb0f.7.azurestaticapps.net").rstrip("/")
     share_url = f"{frontend_url}/chat/{session_id}?userId={user_id}"
     return func.HttpResponse(
         json.dumps({"shareUrl": share_url, "sessionId": session_id}),
