@@ -73,6 +73,21 @@ class TableService:
         return row_key
 
     # ------------------------------------------------------------------
+    # MARK COMPLETED — for fast-path uploads (temp images) that skip OCR
+    # ------------------------------------------------------------------
+
+    def mark_completed(self, row_key: str) -> None:
+        """Set status=completed for a record by RowKey (used by temp image fast path)."""
+        try:
+            entity = self._client.get_entity(partition_key=PARTITION_KEY, row_key=row_key)
+            entity["status"] = "completed"
+            self._client.update_entity(entity=entity, mode=UpdateMode.MERGE)
+            logging.info("mark_completed: RowKey=%s", row_key)
+        except Exception:
+            logging.exception("mark_completed failed for RowKey=%s", row_key)
+            raise
+
+    # ------------------------------------------------------------------
     # UPDATE — write text + summary + tags, mark completed
     # ------------------------------------------------------------------
 
@@ -661,3 +676,4 @@ def get_user(email: str) -> dict | None:
                 "first_name": e.get("first_name", ""), "last_name": e.get("last_name", "")}
     except Exception:
         return None
+
