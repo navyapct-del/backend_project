@@ -6,10 +6,10 @@ import re
 import logging
 
 _CHARS_PER_TOKEN = 4
-CHUNK_TOKENS     = 400          # target ~400 tokens (~1600 chars) — better context density
-OVERLAP_TOKENS   = 80           # ~320 chars overlap — preserves cross-chunk context
-CHUNK_SIZE       = CHUNK_TOKENS  * _CHARS_PER_TOKEN   # 1600 chars
-OVERLAP_SIZE     = OVERLAP_TOKENS * _CHARS_PER_TOKEN  # 320 chars
+CHUNK_TOKENS     = 1200         # larger chunks = fewer API calls = faster processing for big files
+OVERLAP_TOKENS   = 100          # ~400 chars overlap
+CHUNK_SIZE       = CHUNK_TOKENS  * _CHARS_PER_TOKEN   # 4800 chars
+OVERLAP_SIZE     = OVERLAP_TOKENS * _CHARS_PER_TOKEN  # 400 chars
 
 
 def chunk_text(text: str, doc_id: str, filename: str) -> list[dict]:

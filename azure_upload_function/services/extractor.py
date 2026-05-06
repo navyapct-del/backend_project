@@ -480,6 +480,7 @@ def _excel_to_text_and_struct(file_bytes: bytes) -> tuple[str, dict]:
     xf = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
     parts, all_rows, columns = [], [], []
     sheets: dict = {}
+    MAX_ROWS = 2000  # cap per sheet to prevent timeout on huge files
 
     for sheet in xf.sheet_names:
         try:
@@ -487,6 +488,10 @@ def _excel_to_text_and_struct(file_bytes: bytes) -> tuple[str, dict]:
         except Exception as exc:
             logging.warning("_excel_to_text_and_struct: sheet '%s' skipped: %s", sheet, exc)
             continue
+        if len(df) > MAX_ROWS:
+            logging.warning("_excel_to_text_and_struct: sheet '%s' has %d rows — capping at %d",
+                            sheet, len(df), MAX_ROWS)
+            df = df.head(MAX_ROWS)
         parts.append(f"Sheet: {sheet}\n{df.to_string(index=False)}")
         sheet_cols = list(df.columns)
         sheet_rows = _sanitize_rows(df.to_dict(orient="records"))
