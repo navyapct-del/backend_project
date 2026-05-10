@@ -23,20 +23,20 @@ from typing import Any
 # ---------------------------------------------------------------------------
 # Azure Document Intelligence client (PDF + images)
 # ---------------------------------------------------------------------------
-from azure.ai.formrecognizer import DocumentAnalysisClient
+from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials  import AzureKeyCredential
 
-_di_client: DocumentAnalysisClient | None = None
+_di_client: DocumentIntelligenceClient | None = None
 
 
-def _get_di_client() -> DocumentAnalysisClient:
+def _get_di_client() -> DocumentIntelligenceClient:
     global _di_client
     if _di_client is None:
-        _di_client = DocumentAnalysisClient(
+        _di_client = DocumentIntelligenceClient(
             endpoint   = os.environ["DOC_INTELLIGENCE_ENDPOINT"],
             credential = AzureKeyCredential(os.environ["DOC_INTELLIGENCE_KEY"]),
         )
-        logging.info("DocumentAnalysisClient initialised.")
+        logging.info("DocumentIntelligenceClient initialised.")
     return _di_client
 
 
