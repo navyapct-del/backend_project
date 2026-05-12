@@ -173,24 +173,31 @@ def multi_query_retrieve(
 ) -> list[dict]:
     """
     Retrieve chunks using multiple query variants + HyDE for better recall.
-    When doc_ids are provided with multiple docs, guarantees at least 2 chunks
-    per document so cross-doc queries always have context from each source.
+    Embeddings are generated in parallel using ThreadPoolExecutor for speed.
     """
     from services.openai_service import generate_embedding
     from services.search_service import vector_search
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     if use_hyde:
         queries = generate_query_variants(query)
     else:
         queries = [query]
 
-    # Retrieve for each query variant
-    seen_ids: dict[str, dict] = {}   # chunk_id → best chunk
+    # ── Generate all embeddings in parallel ──────────────────────────────
+    embeddings: dict[str, list[float]] = {}
+    with ThreadPoolExecutor(max_workers=len(queries)) as executor:
+        future_to_q = {executor.submit(generate_embedding, q): q for q in queries}
+        for future in as_completed(future_to_q):
+            q = future_to_q[future]
+            emb = future.result()
+            if emb:
+                embeddings[q] = emb
 
-    for q_variant in queries:
-        embedding = generate_embedding(q_variant)
-        if not embedding:
-            continue
+    # ── Search for each variant ───────────────────────────────────────────
+    seen_ids: dict[str, dict] = {}
+
+    for q_variant, embedding in embeddings.items():
         chunks = vector_search(
             query_embedding = embedding,
             query_text      = q_variant,
@@ -201,7 +208,6 @@ def multi_query_retrieve(
         )
         for chunk in chunks:
             cid = chunk["id"]
-            # Keep the version with the highest score
             if cid not in seen_ids or chunk["score"] > seen_ids[cid]["score"]:
                 seen_ids[cid] = chunk
 
@@ -271,8 +277,8 @@ def compress_chunks(query: str, chunks: list[dict]) -> list[dict]:
     if not chunks:
         return chunks
 
-    # Skip compression only when there are very few chunks — not worth the API call
-    if len(chunks) <= 3:
+    # Skip compression for small chunk sets — not worth the extra GPT call
+    if len(chunks) <= 5:
         logging.info("compress_chunks: skipping (chunks=%d)", len(chunks))
         return chunks
 
@@ -316,6 +322,7 @@ JSON:"""
             messages    = [{"role": "user", "content": prompt}],
             temperature = 0.0,
             max_tokens  = 1500,
+            timeout     = 10,
         )
         raw = resp.choices[0].message.content.strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
@@ -515,6 +522,7 @@ Question: {query}
             temperature       = 0.0,
             max_tokens        = 2500,
             frequency_penalty = 0.1,
+            timeout           = 25,
         )
         raw = resp.choices[0].message.content.strip()
 
