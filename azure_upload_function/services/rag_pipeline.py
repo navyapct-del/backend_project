@@ -231,8 +231,9 @@ def multi_query_retrieve(
             per_doc.setdefault(did, []).append(chunk)
 
         guaranteed: list[dict] = []
+        per_doc_guarantee = max(2, top_k // len(doc_ids))
         for did in doc_ids:
-            guaranteed.extend(per_doc.get(did, [])[:2])  # top 2 per doc
+            guaranteed.extend(per_doc.get(did, [])[:per_doc_guarantee])
 
         # Fill remaining slots with highest-scoring chunks not already included
         guaranteed_ids = {c["id"] for c in guaranteed}
@@ -261,7 +262,8 @@ def multi_query_retrieve(
 def compress_chunks(query: str, chunks: list[dict]) -> list[dict]:
     """
     Extract only the passage most relevant to the query from each chunk.
-    Skipped for short/simple queries to avoid stripping relevant content.
+    For multi-doc queries, instructs the extractor to preserve cross-doc
+    comparative content that may not be relevant in isolation.
     Falls back to original chunk text if compression fails.
     """
     from services.openai_service import _get_client, _deployment
@@ -269,20 +271,29 @@ def compress_chunks(query: str, chunks: list[dict]) -> list[dict]:
     if not chunks:
         return chunks
 
-    # Skip compression for short queries — risk of stripping relevant content
-    # outweighs benefit for simple factual questions
-    word_count = len(query.split())
-    if word_count <= 8 or len(chunks) <= 3:
-        logging.info("compress_chunks: skipping (query_words=%d, chunks=%d)", word_count, len(chunks))
+    # Skip compression only when there are very few chunks — not worth the API call
+    if len(chunks) <= 3:
+        logging.info("compress_chunks: skipping (chunks=%d)", len(chunks))
         return chunks
+
+    # Detect multi-doc: more than one unique filename in chunks
+    unique_sources = {c.get("filename", "") for c in chunks}
+    is_multi_doc   = len(unique_sources) > 1
 
     # Build batched extraction prompt
     chunk_texts = []
     for i, chunk in enumerate(chunks):
-        text = (chunk.get("text") or chunk.get("content") or "").strip()
-        chunk_texts.append(f"[Chunk {i+1}]\n{text[:1500]}")
+        text     = (chunk.get("text") or chunk.get("content") or "").strip()
+        filename = chunk.get("filename", f"doc{i+1}")
+        chunk_texts.append(f"[Chunk {i+1} — {filename}]\n{text[:1500]}")
 
     combined = "\n\n".join(chunk_texts)
+
+    multi_doc_note = (
+        "\nNOTE: Chunks come from MULTIPLE documents. For comparison or overview questions, "
+        "preserve content from ALL sources even if it seems redundant in isolation."
+        if is_multi_doc else ""
+    )
 
     prompt = f"""You are a precise information extractor.
 
@@ -290,6 +301,7 @@ For each chunk below, extract ONLY the sentences directly relevant to the questi
 If a chunk has no relevant content, return an empty string for it.
 Return ONLY valid JSON: {{"extracts": ["extract1", "extract2", ...]}}
 The array must have exactly {len(chunks)} elements (one per chunk, empty string if not relevant).
+{multi_doc_note}
 
 Question: {query}
 
@@ -344,7 +356,7 @@ JSON:"""
 # Grounded answer generation
 # ---------------------------------------------------------------------------
 
-# System prompt — defines the assistant's persona and grounding rules
+# System prompt — single document
 _SYSTEM_PROMPT = """You are a helpful, precise AI assistant for document question-answering.
 
 CORE RULES:
@@ -358,6 +370,22 @@ RESPONSE QUALITY:
 - Use numbered lists for multi-part answers
 - Use bullet points for enumerations
 - Bold key terms or figures using **term** syntax"""
+
+# System prompt — multiple documents
+_SYSTEM_PROMPT_MULTI = """You are a helpful, precise AI assistant for multi-document question-answering.
+
+CORE RULES:
+1. Answer ONLY using the provided document context. Do not use external knowledge.
+2. Each source is labelled [Source N: filename]. Always attribute facts to their source.
+3. If a document does not contain relevant information, explicitly state that for that document.
+4. Do not fabricate data, names, or statistics not present in the context.
+
+RESPONSE QUALITY:
+- Address each document separately before giving a combined answer when relevant
+- Use numbered lists for multi-part answers
+- Use bullet points for enumerations
+- Bold key terms or figures using **term** syntax
+- End with a brief cross-document summary if the question asks for comparison or overview"""
 
 
 def grounded_generate(
@@ -445,18 +473,33 @@ def grounded_generate(
 
     format_instructions = _build_format_instructions(response_format, citation_list)
 
+    # For multi-doc queries, add explicit per-document answer instruction
+    is_multi_doc = len(seen_files) > 1
+    multi_doc_instruction = ""
+    if is_multi_doc:
+        source_list = "\n".join(f"- {f}" for f in citation_list)
+        multi_doc_instruction = f"""
+IMPORTANT — Multiple documents detected:
+{source_list}
+
+Structure your answer as:
+1. Answer from each document separately (labelled by filename)
+2. Combined summary / comparison at the end (if relevant to the question)
+"""
+
     user_prompt = f"""Context from documents:
 {context}
 
 ---
 
 Question: {query}
-
+{multi_doc_instruction}
 {format_instructions}"""
 
     try:
-        # Build messages: system + optional history (last 6 turns) + current user prompt
-        messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
+        # Use multi-doc system prompt when multiple sources are present
+        system_prompt = _SYSTEM_PROMPT_MULTI if is_multi_doc else _SYSTEM_PROMPT
+        messages = [{"role": "system", "content": system_prompt}]
         if history:
             # Include last 6 turns (3 user + 3 assistant) to stay within token budget
             for turn in history[-6:]:
@@ -670,11 +713,19 @@ def run_rag_pipeline(
 
     import time as _time
 
-    # ── Step 1: Build cache key — includes doc_ids so different selections
-    #    never share a cached answer (FIX: was missing doc_ids before)
+    # ── Step 1: Build cache key — includes doc_ids + latest processed_at timestamp
+    #    so re-uploading a document immediately invalidates its cached answers
     doc_ids_key = "|".join(sorted(doc_ids)) if doc_ids else ""
+    freshness_key = ""
+    try:
+        docs = table_svc.list_documents()
+        relevant = [d for d in docs if not doc_ids or d["id"] in (doc_ids or [])]
+        if relevant:
+            freshness_key = max(d.get("created_at", "") for d in relevant)
+    except Exception:
+        pass
     cache_key = hashlib.md5(
-        (query + "|" + filename_filter + "|" + uploaded_by + "|" + session_id + "|" + doc_ids_key).encode()
+        (query + "|" + filename_filter + "|" + uploaded_by + "|" + session_id + "|" + doc_ids_key + "|" + freshness_key).encode()
     ).hexdigest()
 
     # ── Step 2: Check cache early ─────────────────────────────────────────

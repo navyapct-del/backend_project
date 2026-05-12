@@ -6,8 +6,8 @@ import re
 import logging
 
 _CHARS_PER_TOKEN = 4
-CHUNK_TOKENS     = 1200         # larger chunks = fewer API calls = faster processing for big files
-OVERLAP_TOKENS   = 100          # ~400 chars overlap
+CHUNK_TOKENS     = 500          # 500 tokens = tighter chunks = better retrieval precision
+OVERLAP_TOKENS   = 50           # ~200 chars overlap
 CHUNK_SIZE       = CHUNK_TOKENS  * _CHARS_PER_TOKEN   # 4800 chars
 OVERLAP_SIZE     = OVERLAP_TOKENS * _CHARS_PER_TOKEN  # 400 chars
 

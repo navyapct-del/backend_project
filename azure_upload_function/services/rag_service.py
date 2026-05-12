@@ -70,7 +70,7 @@ class RAGService:
             "FORMAT:\n"
             "- Use numbered bullet points for multi-part answers\n"
             "- Each point on its own line\n"
-            "- Be concise and factual\n"
+            "- Be thorough and detailed, covering all relevant points\n"
             f"- End with: Sources: {', '.join(citation_list)}\n\n"
             f"Context:\n{context}\n\n"
             f"Question: {query}\n\nAnswer:"
@@ -81,7 +81,7 @@ class RAGService:
                 model       = self._deployment,
                 messages    = [{"role": "user", "content": prompt}],
                 temperature = 0.1,
-                max_tokens  = 800,
+                max_tokens  = 1500,
             )
             answer = response.choices[0].message.content.strip()
             answer = re.sub(r'\s+(\d+\.)\s+', r'\n\1 ', answer).strip()

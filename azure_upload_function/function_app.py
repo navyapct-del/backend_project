@@ -874,7 +874,7 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
             query           = user_query,
             filename_filter = filename_filter,
             uploaded_by     = uploaded_by,
-            top_k           = 7,
+            top_k           = 10,
             use_hyde        = True,
             use_compression = True,
             doc_ids         = doc_ids,
@@ -1343,7 +1343,7 @@ def agent_query(req: func.HttpRequest) -> func.HttpResponse:
                 response = {"type": "text", "data": answer, "source": "upload", "intent": intent}
 
         elif intent == "document_qa":
-            rag_result = run_rag_pipeline(query=q, session_id=session_id, top_k=7, use_hyde=True, use_compression=True)
+            rag_result = run_rag_pipeline(query=q, session_id=session_id, top_k=10, use_hyde=True, use_compression=True)
             response = {"type": rag_result.get("type", "text"), "data": rag_result, "source": "knowledge", "intent": intent}
 
         else:  # general_qa or followup
@@ -1549,7 +1549,7 @@ def agent_ask(req: func.HttpRequest) -> func.HttpResponse:
 
     try:
         from services.rag_pipeline import run_rag_pipeline
-        rag_result = run_rag_pipeline(query=q, session_id=session_id, top_k=7, use_hyde=True, use_compression=True)
+        rag_result = run_rag_pipeline(query=q, session_id=session_id, top_k=10, use_hyde=True, use_compression=True)
         response = {"type": rag_result.get("type", "text"), "data": rag_result, "source": "knowledge", "session_id": session_id, "intent": "general_qa"}
         return func.HttpResponse(_safe_json(response), status_code=200, mimetype="application/json")
     except Exception as exc:
