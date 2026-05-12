@@ -713,6 +713,8 @@ def run_rag_pipeline(
 
     import time as _time
 
+    table_svc = TableService()
+
     # ── Step 1: Build cache key — includes doc_ids + latest processed_at timestamp
     #    so re-uploading a document immediately invalidates its cached answers
     doc_ids_key = "|".join(sorted(doc_ids)) if doc_ids else ""
@@ -757,7 +759,6 @@ def run_rag_pipeline(
     # FIX: previously only picked the single best-scoring doc.
     # Now we collect ALL docs that have structured data and score > 0,
     # merge them into one DataFrame with a _source column for cross-doc queries.
-    table_svc = TableService()
     q_lower   = query.lower()
     q_words   = set(w.strip(".,!?;:()") for w in q_lower.split() if len(w) >= 3)
 
