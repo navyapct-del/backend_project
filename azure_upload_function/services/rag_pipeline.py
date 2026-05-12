@@ -512,13 +512,18 @@ Question: {query}
         resp = _get_client().chat.completions.create(
             model    = _deployment(),
             messages = messages,
-            temperature = 0.0,
-            max_tokens  = 2500,
+            temperature       = 0.0,
+            max_tokens        = 2500,
+            frequency_penalty = 0.1,
         )
         raw = resp.choices[0].message.content.strip()
 
         # Parse structured response
         parsed = _parse_llm_response(raw, citation_list, response_format)
+
+        # ── Post-process text: fix broken numbering ───────────────────────
+        if parsed.get("type") == "text" and parsed.get("answer"):
+            parsed["answer"] = _fix_numbering(parsed["answer"])
 
         # ── Post-process chart data ───────────────────────────────────────
         if parsed.get("type") == "chart":
@@ -586,6 +591,23 @@ def _clean_chart_data(chart: dict, user_query: str = "") -> dict:
     return chart
 
 
+def _fix_numbering(text: str) -> str:
+    """Re-sequence any numbered list in the answer so numbers are strictly 1,2,3,..."""
+    lines = text.split("\n")
+    counter = 0
+    result = []
+    for line in lines:
+        m = re.match(r"^(\s*)(\d+)\.\s+(.+)", line)
+        if m:
+            counter += 1
+            result.append(f"{m.group(1)}{counter}. {m.group(3)}")
+        else:
+            if line.strip() == "":
+                counter = 0  # reset counter on blank line (new list section)
+            result.append(line)
+    return "\n".join(result)
+
+
 def _build_format_instructions(
     response_format: str,
     citation_list: list[str],
@@ -620,9 +642,10 @@ Rules:
 
 Rules:
 - Answer must be comprehensive and directly address the question
-- Use numbered lists (1. 2. 3.) for multi-part answers
+- For multi-part answers use strictly sequential numbered lists: 1. first point\\n2. second point\\n3. third point (never restart numbering, never skip numbers)
 - Use **bold** for key terms and figures
 - Include exact numbers/dates/names from the context
+- Separate each numbered point with a newline character \\n
 - If the answer is not found in the context, say: "No relevant information found in this document." """
 
 
