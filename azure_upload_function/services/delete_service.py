@@ -245,32 +245,55 @@ def _delete_blob_by_path(
 
 def _delete_from_search(record_id: str, result: DeletionResult, log) -> bool:
     """
-    Remove the document from Azure AI Search index.
+    Remove ALL chunks for this document from Azure AI Search index.
+    Documents are chunked at upload — each chunk has its own 'id' (chunk_id)
+    but shares 'doc_id' (record_id). Must delete by doc_id filter, not record_id.
     Returns True if removed or not present (idempotent).
     """
     try:
-        endpoint   = require_env("AZURE_SEARCH_ENDPOINT").rstrip("/")
-        api_key    = require_env("AZURE_SEARCH_KEY")
-        url        = f"{endpoint}/indexes/{_SEARCH_INDEX}/docs/index?api-version={_SEARCH_API_VERSION}"
-        headers    = {"Content-Type": "application/json", "api-key": api_key}
-        body       = {
-            "value": [{
-                "@search.action": "delete",
-                "id":             record_id,
-            }]
-        }
+        endpoint = require_env("AZURE_SEARCH_ENDPOINT").rstrip("/")
+        api_key  = require_env("AZURE_SEARCH_KEY")
+        headers  = {"Content-Type": "application/json", "api-key": api_key}
 
-        resp = requests.post(url, headers=headers, json=body, timeout=15)
+        # Step 1: Find all chunk IDs for this doc_id
+        search_url  = f"{endpoint}/indexes/{_SEARCH_INDEX}/docs/search?api-version={_SEARCH_API_VERSION}"
+        search_resp = requests.post(
+            search_url, headers=headers,
+            json={"filter": f"doc_id eq '{record_id}'", "select": "id", "top": 1000},
+            timeout=15,
+        )
 
-        # 200/207 = success; 404 = index doesn't exist (treat as already gone)
-        if resp.status_code in (200, 207):
-            log.info("Deleted from AI Search index | id=%s", record_id)
-            return True
-        if resp.status_code == 404:
+        if search_resp.status_code == 404:
             log.info("AI Search index not found — treating as already deleted")
             return True
 
-        msg = f"AI Search delete returned unexpected status {resp.status_code}: {resp.text[:200]}"
+        if search_resp.status_code not in (200, 207):
+            msg = f"AI Search chunk lookup returned {search_resp.status_code}: {search_resp.text[:200]}"
+            log.error(msg)
+            result.errors.append(msg)
+            return False
+
+        chunk_ids = [doc["id"] for doc in search_resp.json().get("value", [])]
+
+        # Also include record_id itself (handles legacy single-doc uploads)
+        if record_id not in chunk_ids:
+            chunk_ids.append(record_id)
+
+        log.info("Deleting %d chunks from AI Search for doc_id=%s", len(chunk_ids), record_id)
+
+        # Step 2: Delete all chunks in one batch
+        index_url = f"{endpoint}/indexes/{_SEARCH_INDEX}/docs/index?api-version={_SEARCH_API_VERSION}"
+        del_resp  = requests.post(
+            index_url, headers=headers,
+            json={"value": [{"@search.action": "delete", "id": cid} for cid in chunk_ids]},
+            timeout=15,
+        )
+
+        if del_resp.status_code in (200, 207):
+            log.info("Deleted %d chunks from AI Search | doc_id=%s", len(chunk_ids), record_id)
+            return True
+
+        msg = f"AI Search delete returned unexpected status {del_resp.status_code}: {del_resp.text[:200]}"
         log.error(msg)
         result.errors.append(msg)
         return False
