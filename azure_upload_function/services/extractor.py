@@ -436,7 +436,7 @@ def _ocr(file_bytes: bytes, filename: str) -> str:
     client = _get_di_client()
     poller = client.begin_analyze_document(
         model_id = "prebuilt-read",
-        document = io.BytesIO(file_bytes),
+        body     = io.BytesIO(file_bytes),
     )
     result = poller.result()
     lines  = [line.content for page in result.pages for line in page.lines]
