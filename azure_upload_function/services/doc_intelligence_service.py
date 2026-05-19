@@ -32,7 +32,7 @@ class DocIntelligenceService:
         try:
             poller = self._client.begin_analyze_document(
                 model_id="prebuilt-read",
-                document=file_bytes,
+                body=file_bytes,
             )
             result = poller.result()
 
