@@ -1,77 +1,44 @@
-"""
-rag_pipeline.py — Advanced RAG pipeline with:
 
-  1. Intent classification   — routes to structured engine or prose RAG
-  2. HyDE retrieval          — embeds a hypothetical answer for better recall
-  3. Multi-query retrieval   — 3 query variants merged + deduplicated
-  4. Contextual compression  — extracts only the relevant passage per chunk
-  5. Grounded generation     — strict system prompt, temperature=0, no hallucination
-  6. Self-consistency check  — validates answer is grounded in context
 
-Architecture:
-  query
-    │
-    ├─► intent_classifier()
-    │       │
-    │       ├─ STRUCTURED → query_engine (pandas + LLM plan)
-    │       │
-    │       └─ PROSE / HYBRID
-    │               │
-    │               ├─► multi_query_retrieval()   [3 variants + HyDE]
-    │               ├─► contextual_compression()  [extract relevant passages]
-    │               └─► grounded_generate()       [strict RAG answer]
-    │
-    └─► format_response()
-"""
+import re 
+import json 
+import logging 
+import hashlib 
+from functools import lru_cache 
+from typing import Literal 
 
-import re
-import json
-import logging
-import hashlib
-from functools import lru_cache
-from typing import Literal
+IntentType =Literal ["structured","prose","hybrid"]
 
-# ---------------------------------------------------------------------------
-# Intent types
-# ---------------------------------------------------------------------------
+_STRUCTURED_KEYWORDS ={
 
-IntentType = Literal["structured", "prose", "hybrid"]
+"sum","total","average","avg","mean","count","max","min",
+"how many","number of","add up","calculate",
 
-# Keywords that signal the query engine should handle the request
-_STRUCTURED_KEYWORDS = {
-    # Aggregation
-    "sum", "total", "average", "avg", "mean", "count", "max", "min",
-    "how many", "number of", "add up", "calculate",
-    # Grouping / breakdown
-    "breakdown", "group by", "per", "by department", "by category",
-    "distribution", "frequency",
-    # Comparison
-    "compare", "comparison", "versus", " vs ", "difference between",
-    # Filtering
-    "filter", "where", "only", "exclude",
-    # Sorting
-    "top", "bottom", "highest", "lowest", "ranked",
-    # Listing / enumeration — only route to structured engine for CSV/Excel, not PDFs
-    # (handled by has_structured_data check in classify_intent)
-    "list all", "show all", "show me all", "all the", "give me all",
-    "enumerate", "display all", "fetch all", "get all",
+"breakdown","group by","per","by department","by category",
+"distribution","frequency",
+
+"compare","comparison","versus"," vs ","difference between",
+
+"filter","where","only","exclude",
+
+"top","bottom","highest","lowest","ranked",
+
+"list all","show all","show me all","all the","give me all",
+"enumerate","display all","fetch all","get all",
 }
 
-# Keywords that signal a chart/graph is wanted
-_CHART_KEYWORDS = {
-    "chart", "graph", "plot", "visualize", "visualise", "visualisation",
-    "bar chart", "line chart", "pie chart", "scatter", "histogram",
-    "trend", "over time", "growth", "distribution",
+_CHART_KEYWORDS ={
+"chart","graph","plot","visualize","visualise","visualisation",
+"bar chart","line chart","pie chart","scatter","histogram",
+"trend","over time","growth","distribution",
 }
 
-# Keywords that signal a table is wanted
-_TABLE_KEYWORDS = {
-    "table", "list", "show all", "enumerate", "tabular", "rows", "columns",
-    "spreadsheet", "grid",
+_TABLE_KEYWORDS ={
+"table","list","show all","enumerate","tabular","rows","columns",
+"spreadsheet","grid",
 }
 
-
-def classify_intent(query: str, has_structured_data: bool) -> IntentType:
+def classify_intent (query :str ,has_structured_data :bool )->IntentType :
     """
     Classify query intent to route to the right pipeline.
 
@@ -80,43 +47,35 @@ def classify_intent(query: str, has_structured_data: bool) -> IntentType:
       "prose"      — use RAG (factual questions, summaries, explanations)
       "hybrid"     — try query engine first, fall back to RAG
     """
-    q = query.lower()
+    q =query .lower ()
 
-    # Word-boundary check for short keywords that are substrings of prose words
-    # e.g. "sum" matches "summarize", "avg" matches "average" in wrong context
-    import re as _re
-    def _has_kw(kw: str) -> bool:
-        if len(kw) <= 4:
-            return bool(_re.search(r'\b' + _re.escape(kw) + r'\b', q))
-        return kw in q
+    import re as _re 
+    def _has_kw (kw :str )->bool :
+        if len (kw )<=4 :
+            return bool (_re .search (r'\b'+_re .escape (kw )+r'\b',q ))
+        return kw in q 
 
-    has_chart_intent      = any(k in q for k in _CHART_KEYWORDS)
-    has_structured_intent = any(_has_kw(k) for k in _STRUCTURED_KEYWORDS)
-    has_table_intent      = any(k in q for k in _TABLE_KEYWORDS)
+    has_chart_intent =any (k in q for k in _CHART_KEYWORDS )
+    has_structured_intent =any (_has_kw (k )for k in _STRUCTURED_KEYWORDS )
+    has_table_intent =any (k in q for k in _TABLE_KEYWORDS )
 
-    # Prose-first queries — never route to structured engine
-    prose_triggers = {"summarize", "summary", "explain", "describe", "what is", "who is",
-                      "tell me about", "overview", "introduction", "background"}
-    if any(t in q for t in prose_triggers):
+    prose_triggers ={"summarize","summary","explain","describe","what is","who is",
+    "tell me about","overview","introduction","background"}
+    if any (t in q for t in prose_triggers ):
         return "prose"
 
-    if not has_structured_data:
+    if not has_structured_data :
         return "prose"
 
-    if has_chart_intent or (has_structured_intent and has_structured_data):
+    if has_chart_intent or (has_structured_intent and has_structured_data ):
         return "structured"
 
-    if has_table_intent:
+    if has_table_intent :
         return "hybrid"
 
     return "prose"
 
-
-# ---------------------------------------------------------------------------
-# Multi-query retrieval with HyDE
-# ---------------------------------------------------------------------------
-
-def generate_query_variants(query: str) -> list[str]:
+def generate_query_variants (query :str )->list [str ]:
     """
     Generate 3 semantically diverse query variants + 1 HyDE hypothetical answer.
     Returns [original, variant1, variant2, variant3, hyde_passage].
@@ -124,9 +83,9 @@ def generate_query_variants(query: str) -> list[str]:
     HyDE (Hypothetical Document Embedding): generate a short hypothetical answer
     and embed it — this often retrieves better chunks than the raw question.
     """
-    from services.openai_service import _get_client, _deployment
+    from services .openai_service import _get_client ,_deployment 
 
-    prompt = f"""Given this user question, generate:
+    prompt =f"""Given this user question, generate:
 1. One alternative phrasing (different vocabulary, same intent)
 2. A short hypothetical answer passage (1-2 sentences) that would ideally answer the question
 
@@ -137,171 +96,156 @@ Question: {query}
 
 JSON:"""
 
-    try:
-        resp = _get_client().chat.completions.create(
-            model       = _deployment(),
-            messages    = [{"role": "user", "content": prompt}],
-            temperature = 0.3,
-            max_tokens  = 150,
-            timeout     = 8,
+    try :
+        resp =_get_client ().chat .completions .create (
+        model =_deployment (),
+        messages =[{"role":"user","content":prompt }],
+        temperature =0.3 ,
+        max_tokens =150 ,
+        timeout =8 ,
         )
-        raw = resp.choices[0].message.content.strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw).strip()
-        data     = json.loads(raw)
-        variant  = data.get("variant", "")
-        hyde     = data.get("hyde", "")
-        result   = [query]
-        if variant and variant != query:
-            result.append(variant)
-        if hyde:
-            result.append(hyde)
-        logging.info("generate_query_variants: %d queries total", len(result))
-        return result
-    except Exception as exc:
-        logging.warning("generate_query_variants failed (%s) — using original query only", exc)
-        return [query]
+        raw =resp .choices [0 ].message .content .strip ()
+        raw =re .sub (r"^```(?:json)?\s*","",raw )
+        raw =re .sub (r"\s*```$","",raw ).strip ()
+        data =json .loads (raw )
+        variant =data .get ("variant","")
+        hyde =data .get ("hyde","")
+        result =[query ]
+        if variant and variant !=query :
+            result .append (variant )
+        if hyde :
+            result .append (hyde )
+        logging .info ("generate_query_variants: %d queries total",len (result ))
+        return result 
+    except Exception as exc :
+        logging .warning ("generate_query_variants failed (%s) — using original query only",exc )
+        return [query ]
 
-
-def multi_query_retrieve(
-    query: str,
-    top_k: int = 7,
-    filename_filter: str = "",
-    uploaded_by: str = "",
-    use_hyde: bool = True,
-    doc_ids: list[str] | None = None,
-) -> list[dict]:
+def multi_query_retrieve (
+query :str ,
+top_k :int =7 ,
+filename_filter :str ="",
+uploaded_by :str ="",
+use_hyde :bool =True ,
+doc_ids :list [str ]|None =None ,
+)->list [dict ]:
     """
     Retrieve chunks using multiple query variants + HyDE for better recall.
     Embeddings are generated in parallel using ThreadPoolExecutor for speed.
     """
-    from services.openai_service import generate_embedding
-    from services.search_service import vector_search
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from services .openai_service import generate_embedding 
+    from services .search_service import vector_search 
+    from concurrent .futures import ThreadPoolExecutor ,as_completed 
 
-    if use_hyde:
-        queries = generate_query_variants(query)
-    else:
-        queries = [query]
+    if use_hyde :
+        queries =generate_query_variants (query )
+    else :
+        queries =[query ]
 
-    # ── Generate all embeddings in parallel ──────────────────────────────
-    embeddings: dict[str, list[float]] = {}
-    with ThreadPoolExecutor(max_workers=len(queries)) as executor:
-        future_to_q = {executor.submit(generate_embedding, q): q for q in queries}
-        for future in as_completed(future_to_q):
-            q = future_to_q[future]
-            emb = future.result()
-            if emb:
-                embeddings[q] = emb
+    embeddings :dict [str ,list [float ]]={}
+    with ThreadPoolExecutor (max_workers =len (queries ))as executor :
+        future_to_q ={executor .submit (generate_embedding ,q ):q for q in queries }
+        for future in as_completed (future_to_q ):
+            q =future_to_q [future ]
+            emb =future .result ()
+            if emb :
+                embeddings [q ]=emb 
 
-    # ── Search for each variant ───────────────────────────────────────────
-    seen_ids: dict[str, dict] = {}
+    seen_ids :dict [str ,dict ]={}
 
-    for q_variant, embedding in embeddings.items():
-        chunks = vector_search(
-            query_embedding = embedding,
-            query_text      = q_variant,
-            top             = top_k,
-            filename_filter = filename_filter,
-            uploaded_by     = uploaded_by,
-            doc_ids         = doc_ids,
+    for q_variant ,embedding in embeddings .items ():
+        chunks =vector_search (
+        query_embedding =embedding ,
+        query_text =q_variant ,
+        top =top_k ,
+        filename_filter =filename_filter ,
+        uploaded_by =uploaded_by ,
+        doc_ids =doc_ids ,
         )
-        for chunk in chunks:
-            cid = chunk["id"]
-            if cid not in seen_ids or chunk["score"] > seen_ids[cid]["score"]:
-                seen_ids[cid] = chunk
+        for chunk in chunks :
+            cid =chunk ["id"]
+            if cid not in seen_ids or chunk ["score"]>seen_ids [cid ]["score"]:
+                seen_ids [cid ]=chunk 
 
-    if not seen_ids:
-        # Hard fallback: single query
-        embedding = generate_embedding(query)
-        if embedding:
-            return vector_search(
-                query_embedding = embedding,
-                query_text      = query,
-                top             = top_k,
-                filename_filter = filename_filter,
-                uploaded_by     = uploaded_by,
-                doc_ids         = doc_ids,
+    if not seen_ids :
+
+        embedding =generate_embedding (query )
+        if embedding :
+            return vector_search (
+            query_embedding =embedding ,
+            query_text =query ,
+            top =top_k ,
+            filename_filter =filename_filter ,
+            uploaded_by =uploaded_by ,
+            doc_ids =doc_ids ,
             )
         return []
 
-    # Sort merged results by score, return top_k
-    merged = sorted(seen_ids.values(), key=lambda x: x["score"], reverse=True)
+    merged =sorted (seen_ids .values (),key =lambda x :x ["score"],reverse =True )
 
-    # When multiple doc_ids selected, guarantee at least 2 chunks per doc
-    # so cross-doc queries (summarize both, compare) always have context from each source
-    if doc_ids and len(doc_ids) > 1:
-        per_doc: dict[str, list] = {}
-        for chunk in merged:
-            did = chunk.get("doc_id", "")
-            per_doc.setdefault(did, []).append(chunk)
+    if doc_ids and len (doc_ids )>1 :
+        per_doc :dict [str ,list ]={}
+        for chunk in merged :
+            did =chunk .get ("doc_id","")
+            per_doc .setdefault (did ,[]).append (chunk )
 
-        guaranteed: list[dict] = []
-        per_doc_guarantee = max(2, top_k // len(doc_ids))
-        for did in doc_ids:
-            guaranteed.extend(per_doc.get(did, [])[:per_doc_guarantee])
+        guaranteed :list [dict ]=[]
+        per_doc_guarantee =max (2 ,top_k //len (doc_ids ))
+        for did in doc_ids :
+            guaranteed .extend (per_doc .get (did ,[])[:per_doc_guarantee ])
 
-        # Fill remaining slots with highest-scoring chunks not already included
-        guaranteed_ids = {c["id"] for c in guaranteed}
-        for chunk in merged:
-            if len(guaranteed) >= top_k:
-                break
-            if chunk["id"] not in guaranteed_ids:
-                guaranteed.append(chunk)
-                guaranteed_ids.add(chunk["id"])
+        guaranteed_ids ={c ["id"]for c in guaranteed }
+        for chunk in merged :
+            if len (guaranteed )>=top_k :
+                break 
+            if chunk ["id"]not in guaranteed_ids :
+                guaranteed .append (chunk )
+                guaranteed_ids .add (chunk ["id"])
 
-        result = guaranteed[:top_k + len(doc_ids)]  # allow slightly more for multi-doc
-        logging.info("multi_query_retrieve: multi-doc guarantee → %d chunks across %d docs",
-                     len(result), len(doc_ids))
-    else:
-        result = merged[:top_k]
+        result =guaranteed [:top_k +len (doc_ids )]
+        logging .info ("multi_query_retrieve: multi-doc guarantee → %d chunks across %d docs",
+        len (result ),len (doc_ids ))
+    else :
+        result =merged [:top_k ]
 
-    logging.info("multi_query_retrieve: %d unique chunks from %d queries → returning %d",
-                 len(seen_ids), len(queries), len(result))
-    return result
+    logging .info ("multi_query_retrieve: %d unique chunks from %d queries → returning %d",
+    len (seen_ids ),len (queries ),len (result ))
+    return result 
 
-
-# ---------------------------------------------------------------------------
-# Contextual compression
-# ---------------------------------------------------------------------------
-
-def compress_chunks(query: str, chunks: list[dict]) -> list[dict]:
+def compress_chunks (query :str ,chunks :list [dict ])->list [dict ]:
     """
     Extract only the passage most relevant to the query from each chunk.
     For multi-doc queries, instructs the extractor to preserve cross-doc
     comparative content that may not be relevant in isolation.
     Falls back to original chunk text if compression fails.
     """
-    from services.openai_service import _get_client, _deployment
+    from services .openai_service import _get_client ,_deployment 
 
-    if not chunks:
-        return chunks
+    if not chunks :
+        return chunks 
 
-    # Skip compression for small chunk sets — not worth the extra GPT call
-    if len(chunks) <= 5:
-        logging.info("compress_chunks: skipping (chunks=%d)", len(chunks))
-        return chunks
+    if len (chunks )<=5 :
+        logging .info ("compress_chunks: skipping (chunks=%d)",len (chunks ))
+        return chunks 
 
-    # Detect multi-doc: more than one unique filename in chunks
-    unique_sources = {c.get("filename", "") for c in chunks}
-    is_multi_doc   = len(unique_sources) > 1
+    unique_sources ={c .get ("filename","")for c in chunks }
+    is_multi_doc =len (unique_sources )>1 
 
-    # Build batched extraction prompt
-    chunk_texts = []
-    for i, chunk in enumerate(chunks):
-        text     = (chunk.get("text") or chunk.get("content") or "").strip()
-        filename = chunk.get("filename", f"doc{i+1}")
-        chunk_texts.append(f"[Chunk {i+1} — {filename}]\n{text[:1500]}")
+    chunk_texts =[]
+    for i ,chunk in enumerate (chunks ):
+        text =(chunk .get ("text")or chunk .get ("content")or "").strip ()
+        filename =chunk .get ("filename",f"doc{i+1}")
+        chunk_texts .append (f"[Chunk {i+1} — {filename}]\n{text[:1500]}")
 
-    combined = "\n\n".join(chunk_texts)
+    combined ="\n\n".join (chunk_texts )
 
-    multi_doc_note = (
-        "\nNOTE: Chunks come from MULTIPLE documents. For comparison or overview questions, "
-        "preserve content from ALL sources even if it seems redundant in isolation."
-        if is_multi_doc else ""
+    multi_doc_note =(
+    "\nNOTE: Chunks come from MULTIPLE documents. For comparison or overview questions, "
+    "preserve content from ALL sources even if it seems redundant in isolation."
+    if is_multi_doc else ""
     )
 
-    prompt = f"""You are a precise information extractor.
+    prompt =f"""You are a precise information extractor.
 
 For each chunk below, extract ONLY the sentences directly relevant to the question.
 If a chunk has no relevant content, return an empty string for it.
@@ -316,55 +260,48 @@ Chunks:
 
 JSON:"""
 
-    try:
-        resp = _get_client().chat.completions.create(
-            model       = _deployment(),
-            messages    = [{"role": "user", "content": prompt}],
-            temperature = 0.0,
-            max_tokens  = 1500,
-            timeout     = 10,
+    try :
+        resp =_get_client ().chat .completions .create (
+        model =_deployment (),
+        messages =[{"role":"user","content":prompt }],
+        temperature =0.0 ,
+        max_tokens =1500 ,
+        timeout =10 ,
         )
-        raw = resp.choices[0].message.content.strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw).strip()
-        data     = json.loads(raw)
-        extracts = data.get("extracts", [])
+        raw =resp .choices [0 ].message .content .strip ()
+        raw =re .sub (r"^```(?:json)?\s*","",raw )
+        raw =re .sub (r"\s*```$","",raw ).strip ()
+        data =json .loads (raw )
+        extracts =data .get ("extracts",[])
 
-        compressed = []
-        for i, chunk in enumerate(chunks):
-            extract = extracts[i].strip() if i < len(extracts) else ""
-            if extract:
-                # Use compressed text but keep all metadata
-                new_chunk = dict(chunk)
-                new_chunk["text"]              = extract
-                new_chunk["_compressed"]       = True
-                new_chunk["_original_text_len"] = len(chunk.get("text") or chunk.get("content") or "")
-                compressed.append(new_chunk)
-            else:
-                # Chunk not relevant — still include with original text (lower weight)
-                compressed.append(chunk)
+        compressed =[]
+        for i ,chunk in enumerate (chunks ):
+            extract =extracts [i ].strip ()if i <len (extracts )else ""
+            if extract :
 
-        # Filter out chunks where compression returned empty AND original text is short
-        relevant = [
-            c for c in compressed
-            if (c.get("text") or c.get("content") or "").strip()
+                new_chunk =dict (chunk )
+                new_chunk ["text"]=extract 
+                new_chunk ["_compressed"]=True 
+                new_chunk ["_original_text_len"]=len (chunk .get ("text")or chunk .get ("content")or "")
+                compressed .append (new_chunk )
+            else :
+
+                compressed .append (chunk )
+
+        relevant =[
+        c for c in compressed 
+        if (c .get ("text")or c .get ("content")or "").strip ()
         ]
 
-        logging.info("compress_chunks: %d → %d relevant chunks after compression",
-                     len(chunks), len(relevant))
-        return relevant if relevant else chunks
+        logging .info ("compress_chunks: %d → %d relevant chunks after compression",
+        len (chunks ),len (relevant ))
+        return relevant if relevant else chunks 
 
-    except Exception as exc:
-        logging.warning("compress_chunks failed (%s) — using original chunks", exc)
-        return chunks
+    except Exception as exc :
+        logging .warning ("compress_chunks failed (%s) — using original chunks",exc )
+        return chunks 
 
-
-# ---------------------------------------------------------------------------
-# Grounded answer generation
-# ---------------------------------------------------------------------------
-
-# System prompt — single document
-_SYSTEM_PROMPT = """You are a helpful, precise AI assistant for document question-answering.
+_SYSTEM_PROMPT ="""You are a helpful, precise AI assistant for document question-answering.
 
 CORE RULES:
 1. Answer ONLY using the provided document context. Do not use external knowledge.
@@ -378,8 +315,7 @@ RESPONSE QUALITY:
 - Use bullet points for enumerations
 - Bold key terms or figures using **term** syntax"""
 
-# System prompt — multiple documents
-_SYSTEM_PROMPT_MULTI = """You are a helpful, precise AI assistant for multi-document question-answering.
+_SYSTEM_PROMPT_MULTI ="""You are a helpful, precise AI assistant for multi-document question-answering.
 
 CORE RULES:
 1. Answer ONLY using the provided document context. Do not use external knowledge.
@@ -394,13 +330,12 @@ RESPONSE QUALITY:
 - Bold key terms or figures using **term** syntax
 - End with a brief cross-document summary if the question asks for comparison or overview"""
 
-
-def grounded_generate(
-    query: str,
-    chunks: list[dict],
-    response_format: Literal["text", "table", "chart", "auto"] = "auto",
-    history: list[dict] | None = None,
-) -> dict:
+def grounded_generate (
+query :str ,
+chunks :list [dict ],
+response_format :Literal ["text","table","chart","auto"]="auto",
+history :list [dict ]|None =None ,
+)->dict :
     """
     Generate a grounded answer from compressed, relevant chunks.
 
@@ -420,72 +355,68 @@ def grounded_generate(
           "chart_type": str,  # for chart
         }
     """
-    from services.openai_service import _get_client, _deployment
+    from services .openai_service import _get_client ,_deployment 
 
-    if not chunks:
+    if not chunks :
         return {
-            "type":   "text",
-            "answer": "No relevant information found in this document.",
+        "type":"text",
+        "answer":"No relevant information found in this document.",
         }
 
-    # Build context with clear source attribution
-    context_parts = []
-    citation_list = []
-    seen_files    = set()
+    context_parts =[]
+    citation_list =[]
+    seen_files =set ()
 
-    for i, chunk in enumerate(chunks, 1):
-        filename = chunk.get("filename", f"Document {i}")
-        text     = (chunk.get("text") or chunk.get("content") or "").strip()
-        summary  = chunk.get("summary", "")
-        score    = chunk.get("score", 0)
+    for i ,chunk in enumerate (chunks ,1 ):
+        filename =chunk .get ("filename",f"Document {i}")
+        text =(chunk .get ("text")or chunk .get ("content")or "").strip ()
+        summary =chunk .get ("summary","")
+        score =chunk .get ("score",0 )
 
-        if not text:
-            continue
+        if not text :
+            continue 
 
-        # Include summary as context header for first chunk of each document
-        if filename not in seen_files and summary:
-            context_parts.append(
-                f"[Source {i}: {filename} | relevance: {score:.2f}]\n"
-                f"Document summary: {summary}\n\n"
-                f"Relevant excerpt:\n{text}"
+        if filename not in seen_files and summary :
+            context_parts .append (
+            f"[Source {i}: {filename} | relevance: {score:.2f}]\n"
+            f"Document summary: {summary}\n\n"
+            f"Relevant excerpt:\n{text}"
             )
-        else:
-            context_parts.append(
-                f"[Source {i}: {filename} | relevance: {score:.2f}]\n{text}"
+        else :
+            context_parts .append (
+            f"[Source {i}: {filename} | relevance: {score:.2f}]\n{text}"
             )
 
-        if filename not in seen_files:
-            seen_files.add(filename)
-            citation_list.append(filename)
+        if filename not in seen_files :
+            seen_files .add (filename )
+            citation_list .append (filename )
 
-    if not context_parts:
+    if not context_parts :
         return {
-            "type":   "text",
-            "answer": "No relevant information found in this document.",
+        "type":"text",
+        "answer":"No relevant information found in this document.",
         }
 
-    context = "\n\n---\n\n".join(context_parts)
+    context ="\n\n---\n\n".join (context_parts )
 
-    # Determine format instructions
-    q_lower = query.lower()
-    if response_format == "auto":
-        wants_chart = any(k in q_lower for k in _CHART_KEYWORDS)
-        wants_table = any(k in q_lower for k in _TABLE_KEYWORDS)
-        if wants_chart:
-            response_format = "chart"
-        elif wants_table:
-            response_format = "table"
-        else:
-            response_format = "text"
+    q_lower =query .lower ()
+    if response_format =="auto":
+        wants_chart =any (k in q_lower for k in _CHART_KEYWORDS )
+        wants_table =any (k in q_lower for k in _TABLE_KEYWORDS )
+        if wants_chart :
+            response_format ="chart"
+        elif wants_table :
+            response_format ="table"
+        else :
+            response_format ="text"
 
-    format_instructions = _build_format_instructions(response_format, citation_list)
+    format_instructions =_build_format_instructions (response_format ,citation_list )
 
-    # For multi-doc queries, add explicit per-document answer instruction
-    is_multi_doc = len(seen_files) > 1
-    multi_doc_instruction = ""
-    if is_multi_doc:
-        source_list = "\n".join(f"- {f}" for f in citation_list)
-        multi_doc_instruction = f"""
+    is_multi_doc =len (seen_files )>1 
+    multi_doc_instruction =""
+    if is_multi_doc :
+        source_list ="\n".join (f"- {f}"for f in citation_list )
+        multi_doc_instruction =f"""
 IMPORTANT — Multiple documents detected:
 {source_list}
 
@@ -494,7 +425,7 @@ Structure your answer as:
 2. Combined summary / comparison at the end (if relevant to the question)
 """
 
-    user_prompt = f"""Context from documents:
+    user_prompt =f"""Context from documents:
 {context}
 
 ---
@@ -503,126 +434,118 @@ Question: {query}
 {multi_doc_instruction}
 {format_instructions}"""
 
-    try:
-        # Use multi-doc system prompt when multiple sources are present
-        system_prompt = _SYSTEM_PROMPT_MULTI if is_multi_doc else _SYSTEM_PROMPT
-        messages = [{"role": "system", "content": system_prompt}]
-        if history:
-            # Include last 6 turns (3 user + 3 assistant) to stay within token budget
-            for turn in history[-6:]:
-                role    = turn.get("role", "user")
-                content = turn.get("content", "")
-                if role in ("user", "assistant") and content:
-                    messages.append({"role": role, "content": content[:800]})
-        messages.append({"role": "user", "content": user_prompt})
+    try :
 
-        resp = _get_client().chat.completions.create(
-            model    = _deployment(),
-            messages = messages,
-            temperature       = 0.0,
-            max_tokens        = 2500,
-            frequency_penalty = 0.1,
-            timeout           = 25,
+        system_prompt =_SYSTEM_PROMPT_MULTI if is_multi_doc else _SYSTEM_PROMPT 
+        messages =[{"role":"system","content":system_prompt }]
+        if history :
+
+            for turn in history [-6 :]:
+                role =turn .get ("role","user")
+                content =turn .get ("content","")
+                if role in ("user","assistant")and content :
+                    messages .append ({"role":role ,"content":content [:800 ]})
+        messages .append ({"role":"user","content":user_prompt })
+
+        resp =_get_client ().chat .completions .create (
+        model =_deployment (),
+        messages =messages ,
+        temperature =0.0 ,
+        max_tokens =2500 ,
+        frequency_penalty =0.1 ,
+        timeout =25 ,
         )
-        raw = resp.choices[0].message.content.strip()
+        raw =resp .choices [0 ].message .content .strip ()
 
-        # Parse structured response
-        parsed = _parse_llm_response(raw, citation_list, response_format)
+        parsed =_parse_llm_response (raw ,citation_list ,response_format )
 
-        # ── Post-process text: fix broken numbering ───────────────────────
-        if parsed.get("type") == "text" and parsed.get("answer"):
-            parsed["answer"] = _fix_numbering(parsed["answer"])
+        if parsed .get ("type")=="text"and parsed .get ("answer"):
+            parsed ["answer"]=_fix_numbering (parsed ["answer"])
 
-        # ── Post-process chart data ───────────────────────────────────────
-        if parsed.get("type") == "chart":
-            parsed = _clean_chart_data(parsed, user_query=query)
+        if parsed .get ("type")=="chart":
+            parsed =_clean_chart_data (parsed ,user_query =query )
 
-        logging.info("grounded_generate: type=%s answer_len=%d",
-                     parsed.get("type"), len(str(parsed.get("answer", ""))))
-        return parsed
+        logging .info ("grounded_generate: type=%s answer_len=%d",
+        parsed .get ("type"),len (str (parsed .get ("answer",""))))
+        return parsed 
 
-    except Exception as exc:
-        logging.error("grounded_generate failed: %s", exc)
+    except Exception as exc :
+        logging .error ("grounded_generate failed: %s",exc )
         return {
-            "type":   "text",
-            "answer": "Failed to generate answer. Please try again.",
+        "type":"text",
+        "answer":"Failed to generate answer. Please try again.",
         }
 
-
-def _clean_chart_data(chart: dict, user_query: str = "") -> dict:
+def _clean_chart_data (chart :dict ,user_query :str ="")->dict :
     """
     Post-process chart data for quality.
     Respects explicit user chart type requests — never downgrades pie→bar
     if the user explicitly asked for a pie chart.
     """
-    chart_type    = chart.get("chart_type", "bar")
-    labels        = chart.get("labels", [])
-    values        = chart.get("values", [])
-    _q = user_query.lower()
-    user_wants_pie = any(k in _q for k in ("pie chart", "pie graph", " pie ", "as pie", "a pie"))
+    chart_type =chart .get ("chart_type","bar")
+    labels =chart .get ("labels",[])
+    values =chart .get ("values",[])
+    _q =user_query .lower ()
+    user_wants_pie =any (k in _q for k in ("pie chart","pie graph"," pie ","as pie","a pie"))
 
-    if not labels or not values:
-        return chart
+    if not labels or not values :
+        return chart 
 
-    # Align lengths
-    min_len = min(len(labels), len(values))
-    labels  = labels[:min_len]
-    values  = values[:min_len]
+    min_len =min (len (labels ),len (values ))
+    labels =labels [:min_len ]
+    values =values [:min_len ]
 
-    # Convert values to numbers, replace None with 0
-    clean_values = []
-    for v in values:
-        try:
-            clean_values.append(float(v) if v is not None else 0.0)
-        except (TypeError, ValueError):
-            clean_values.append(0.0)
+    clean_values =[]
+    for v in values :
+        try :
+            clean_values .append (float (v )if v is not None else 0.0 )
+        except (TypeError ,ValueError ):
+            clean_values .append (0.0 )
 
-    if chart_type == "pie":
-        # Filter out zero/negative slices
-        filtered = [(l, v) for l, v in zip(labels, clean_values) if v > 0]
-        if not filtered:
-            chart["labels"] = labels
-            chart["values"] = clean_values
-            return chart
-        # Only downgrade to bar if user did NOT explicitly ask for pie
-        if len(filtered) == 1 and not user_wants_pie:
-            chart["chart_type"] = "bar"
-            chart["labels"]     = [f[0] for f in filtered]
-            chart["values"]     = [f[1] for f in filtered]
-            return chart
-        chart["labels"] = [f[0] for f in filtered]
-        chart["values"] = [f[1] for f in filtered]
-    else:
-        chart["labels"] = labels
-        chart["values"] = clean_values
+    if chart_type =="pie":
 
-    return chart
+        filtered =[(l ,v )for l ,v in zip (labels ,clean_values )if v >0 ]
+        if not filtered :
+            chart ["labels"]=labels 
+            chart ["values"]=clean_values 
+            return chart 
 
+        if len (filtered )==1 and not user_wants_pie :
+            chart ["chart_type"]="bar"
+            chart ["labels"]=[f [0 ]for f in filtered ]
+            chart ["values"]=[f [1 ]for f in filtered ]
+            return chart 
+        chart ["labels"]=[f [0 ]for f in filtered ]
+        chart ["values"]=[f [1 ]for f in filtered ]
+    else :
+        chart ["labels"]=labels 
+        chart ["values"]=clean_values 
 
-def _fix_numbering(text: str) -> str:
+    return chart 
+
+def _fix_numbering (text :str )->str :
     """Re-sequence any numbered list in the answer so numbers are strictly 1,2,3,..."""
-    lines = text.split("\n")
-    counter = 0
-    result = []
-    for line in lines:
-        m = re.match(r"^(\s*)(\d+)\.\s+(.+)", line)
-        if m:
-            counter += 1
-            result.append(f"{m.group(1)}{counter}. {m.group(3)}")
-        else:
-            if line.strip() == "":
-                counter = 0  # reset counter on blank line (new list section)
-            result.append(line)
-    return "\n".join(result)
+    lines =text .split ("\n")
+    counter =0 
+    result =[]
+    for line in lines :
+        m =re .match (r"^(\s*)(\d+)\.\s+(.+)",line )
+        if m :
+            counter +=1 
+            result .append (f"{m.group(1)}{counter}. {m.group(3)}")
+        else :
+            if line .strip ()=="":
+                counter =0 
+            result .append (line )
+    return "\n".join (result )
 
-
-def _build_format_instructions(
-    response_format: str,
-    citation_list: list[str],
-) -> str:
+def _build_format_instructions (
+response_format :str ,
+citation_list :list [str ],
+)->str :
     """Build format-specific instructions for the LLM."""
 
-    if response_format == "table":
+    if response_format =="table":
         return """Respond with ONLY a valid JSON object in this exact format:
 {"type":"table","columns":["Col1","Col2","Col3"],"rows":[{"Col1":"v1","Col2":"v2","Col3":"v3"}],"answer":"1-line summary of the table"}
 
@@ -632,7 +555,7 @@ Rules:
 - Include every relevant row — do not truncate
 - "answer" should be a 1-line summary of what the table shows"""
 
-    if response_format == "chart":
+    if response_format =="chart":
         return """Respond with ONLY a valid JSON object in this exact format:
 {"type":"chart","chart_type":"bar|line|pie|area|scatter","labels":["A","B","C"],"values":[10,20,30],"answer":"1-line summary"}
 
@@ -644,7 +567,6 @@ Rules:
 - values = corresponding numeric values
 - If multiple series exist, use: {"type":"chart","chart_type":"bar","series":{"Series1":[1,2,3],"Series2":[4,5,6]},"labels":["A","B","C"],"answer":"..."}"""
 
-    # Default: text
     return """Respond with ONLY a valid JSON object in this exact format:
 {"type":"text","answer":"<your detailed answer here>"}
 
@@ -656,75 +578,62 @@ Rules:
 - Separate each numbered point with a newline character \\n
 - If the answer is not found in the context, say: "No relevant information found in this document." """
 
-
-def _parse_llm_response(
-    raw: str,
-    citation_list: list[str],
-    expected_format: str,
-) -> dict:
+def _parse_llm_response (
+raw :str ,
+citation_list :list [str ],
+expected_format :str ,
+)->dict :
     """
     Parse LLM response into a structured dict.
     Handles: valid JSON, JSON in markdown fences, plain text fallback.
     """
-    # Strip markdown code fences
-    cleaned = re.sub(r"^```(?:json)?\s*", "", raw)
-    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
 
-    # Try direct JSON parse
-    try:
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, dict) and "type" in parsed:
-            # Remove sources field if present (we don't expose it)
-            parsed.pop("sources", None)
-            return parsed
-    except Exception:
-        pass
+    cleaned =re .sub (r"^```(?:json)?\s*","",raw )
+    cleaned =re .sub (r"\s*```$","",cleaned ).strip ()
 
-    # Try extracting JSON object from mixed response
-    m = re.search(r'\{[\s\S]*\}', cleaned)
-    if m:
-        try:
-            parsed = json.loads(m.group())
-            if isinstance(parsed, dict) and "type" in parsed:
-                parsed.pop("sources", None)
-                return parsed
-        except Exception:
-            pass
+    try :
+        parsed =json .loads (cleaned )
+        if isinstance (parsed ,dict )and "type"in parsed :
 
-    # Plain text fallback — wrap in text envelope
-    answer_text = raw.strip().lstrip("{[").rstrip("}]").strip()
-    if not answer_text:
-        answer_text = raw
-    logging.warning("_parse_llm_response: LLM returned plain text, wrapping as text response (len=%d)", len(answer_text))
+            parsed .pop ("sources",None )
+            return parsed 
+    except Exception :
+        pass 
+
+    m =re .search (r'\{[\s\S]*\}',cleaned )
+    if m :
+        try :
+            parsed =json .loads (m .group ())
+            if isinstance (parsed ,dict )and "type"in parsed :
+                parsed .pop ("sources",None )
+                return parsed 
+        except Exception :
+            pass 
+
+    answer_text =raw .strip ().lstrip ("{[").rstrip ("}]").strip ()
+    if not answer_text :
+        answer_text =raw 
+    logging .warning ("_parse_llm_response: LLM returned plain text, wrapping as text response (len=%d)",len (answer_text ))
     return {
-        "type":   "text",
-        "answer": answer_text,
+    "type":"text",
+    "answer":answer_text ,
     }
 
+_pipeline_cache :dict [str ,tuple [dict ,float ]]={}
+_MAX_CACHE_SIZE =300 
+_CACHE_TTL_SECS =1800 
 
-# ---------------------------------------------------------------------------
-# Main pipeline entry point
-# ---------------------------------------------------------------------------
-
-# Answer cache: query_hash → (response dict, timestamp)
-# Key uses query + filename_filter only — document content is reflected in the answer itself.
-# TTL: 30 minutes — ensures stale answers after document updates are evicted.
-_pipeline_cache: dict[str, tuple[dict, float]] = {}
-_MAX_CACHE_SIZE = 300
-_CACHE_TTL_SECS = 1800  # 30 minutes
-
-
-def run_rag_pipeline(
-    query:           str,
-    filename_filter: str = "",
-    uploaded_by:     str = "",
-    session_id:      str = "",
-    top_k:           int = 7,
-    use_hyde:        bool = True,
-    use_compression: bool = True,
-    doc_ids:         list[str] | None = None,
-    history:         list[dict] | None = None,
-) -> dict:
+def run_rag_pipeline (
+query :str ,
+filename_filter :str ="",
+uploaded_by :str ="",
+session_id :str ="",
+top_k :int =7 ,
+use_hyde :bool =True ,
+use_compression :bool =True ,
+doc_ids :list [str ]|None =None ,
+history :list [dict ]|None =None ,
+)->dict :
     """
     Full advanced RAG pipeline entry point.
 
@@ -737,219 +646,202 @@ def run_rag_pipeline(
     Returns a response dict with type, answer, sources, and optional
     table/chart data.
     """
-    from services.table_service import TableService
+    from services .table_service import TableService 
 
-    if not query or not query.strip():
-        return {"type": "text", "answer": "No question provided."}
+    if not query or not query .strip ():
+        return {"type":"text","answer":"No question provided."}
 
-    import time as _time
+    import time as _time 
 
-    table_svc = TableService()
+    table_svc =TableService ()
 
-    # ── Step 1: Build cache key — includes doc_ids + latest processed_at timestamp
-    #    so re-uploading a document immediately invalidates its cached answers
-    doc_ids_key = "|".join(sorted(doc_ids)) if doc_ids else ""
-    freshness_key = ""
-    try:
-        docs = table_svc.list_documents()
-        relevant = [d for d in docs if not doc_ids or d["id"] in (doc_ids or [])]
-        if relevant:
-            freshness_key = max(d.get("created_at", "") for d in relevant)
-    except Exception:
-        pass
-    cache_key = hashlib.md5(
-        (query + "|" + filename_filter + "|" + uploaded_by + "|" + session_id + "|" + doc_ids_key + "|" + freshness_key).encode()
-    ).hexdigest()
+    doc_ids_key ="|".join (sorted (doc_ids ))if doc_ids else ""
+    freshness_key =""
+    try :
+        docs =table_svc .list_documents ()
+        relevant =[d for d in docs if not doc_ids or d ["id"]in (doc_ids or [])]
+        if relevant :
+            freshness_key =max (d .get ("created_at","")for d in relevant )
+    except Exception :
+        pass 
+    cache_key =hashlib .md5 (
+    (query +"|"+filename_filter +"|"+uploaded_by +"|"+session_id +"|"+doc_ids_key +"|"+freshness_key ).encode ()
+    ).hexdigest ()
 
-    # ── Step 2: Check cache early ─────────────────────────────────────────
-    cached = _pipeline_cache.get(cache_key)
-    if cached:
-        result, ts = cached
-        if _time.time() - ts < _CACHE_TTL_SECS:
-            logging.info("run_rag_pipeline: cache hit")
-            return result
-        del _pipeline_cache[cache_key]
+    cached =_pipeline_cache .get (cache_key )
+    if cached :
+        result ,ts =cached 
+        if _time .time ()-ts <_CACHE_TTL_SECS :
+            logging .info ("run_rag_pipeline: cache hit")
+            return result 
+        del _pipeline_cache [cache_key ]
 
-    # ── Step 3: Multi-query retrieval with HyDE ───────────────────────────
-    chunks = multi_query_retrieve(
-        query           = query,
-        top_k           = top_k,
-        filename_filter = filename_filter,
-        uploaded_by     = uploaded_by,
-        use_hyde        = use_hyde,
-        doc_ids         = doc_ids,
+    chunks =multi_query_retrieve (
+    query =query ,
+    top_k =top_k ,
+    filename_filter =filename_filter ,
+    uploaded_by =uploaded_by ,
+    use_hyde =use_hyde ,
+    doc_ids =doc_ids ,
     )
 
-    if not chunks:
+    if not chunks :
         return {
-            "type":   "text",
-            "answer": "No relevant information found in this document.",
+        "type":"text",
+        "answer":"No relevant information found in this document.",
         }
 
-    # ── Step 4: Collect structured data from ALL relevant docs ────────────
-    # FIX: previously only picked the single best-scoring doc.
-    # Now we collect ALL docs that have structured data and score > 0,
-    # merge them into one DataFrame with a _source column for cross-doc queries.
-    q_lower   = query.lower()
-    q_words   = set(w.strip(".,!?;:()") for w in q_lower.split() if len(w) >= 3)
+    q_lower =query .lower ()
+    q_words =set (w .strip (".,!?;:()")for w in q_lower .split ()if len (w )>=3 )
 
-    def _stem(w: str) -> str:
-        if w.endswith("ing") and len(w) > 5: return w[:-3]
-        if w.endswith("ies") and len(w) > 4: return w[:-3] + "y"
-        if w.endswith("es")  and len(w) > 4: return w[:-2]
-        if w.endswith("s")   and len(w) > 3: return w[:-1]
-        return w
+    def _stem (w :str )->str :
+        if w .endswith ("ing")and len (w )>5 :return w [:-3 ]
+        if w .endswith ("ies")and len (w )>4 :return w [:-3 ]+"y"
+        if w .endswith ("es")and len (w )>4 :return w [:-2 ]
+        if w .endswith ("s")and len (w )>3 :return w [:-1 ]
+        return w 
 
-    stemmed_q_words = {_stem(w) for w in q_words} | q_words
+    stemmed_q_words ={_stem (w )for w in q_words }|q_words 
 
-    def _sd_relevance_score(sd: dict, filename: str) -> int:
-        score = 0
-        sd_columns = sd.get("columns", [])
-        if not sd_columns and sd.get("sheets"):
-            for sheet_data in sd["sheets"].values():
-                sd_columns = sheet_data.get("columns", [])
-                if sd_columns:
-                    break
-        for col in sd_columns:
-            col_lower = col.lower().replace("_", " ").replace("-", " ")
-            col_words = set(col_lower.split())
-            stemmed_col_words = {_stem(w) for w in col_words} | col_words
-            for qw in stemmed_q_words:
-                if qw in col_lower or any(qw in cw or cw in qw for cw in stemmed_col_words):
-                    score += 3
-                    break
-        fname_lower = filename.lower().replace("_", " ").replace("-", " ")
-        for qw in stemmed_q_words:
-            if qw in fname_lower:
-                score += 5
-                break
-        chart_agg_kw = {"chart", "graph", "plot", "total", "sum", "average",
-                        "count", "max", "min", "distribution", "breakdown",
-                        "how many", "number of", "how much", "avg", "mean"}
-        if any(k in q_lower for k in chart_agg_kw) and sd_columns:
-            score += 1
-        # Any structured intent keyword → give base score so structured engine is tried
-        if any(k in q_lower for k in _STRUCTURED_KEYWORDS) and sd_columns:
-            score += 1
-        return score
+    def _sd_relevance_score (sd :dict ,filename :str )->int :
+        score =0 
+        sd_columns =sd .get ("columns",[])
+        if not sd_columns and sd .get ("sheets"):
+            for sheet_data in sd ["sheets"].values ():
+                sd_columns =sheet_data .get ("columns",[])
+                if sd_columns :
+                    break 
+        for col in sd_columns :
+            col_lower =col .lower ().replace ("_"," ").replace ("-"," ")
+            col_words =set (col_lower .split ())
+            stemmed_col_words ={_stem (w )for w in col_words }|col_words 
+            for qw in stemmed_q_words :
+                if qw in col_lower or any (qw in cw or cw in qw for cw in stemmed_col_words ):
+                    score +=3 
+                    break 
+        fname_lower =filename .lower ().replace ("_"," ").replace ("-"," ")
+        for qw in stemmed_q_words :
+            if qw in fname_lower :
+                score +=5 
+                break 
+        chart_agg_kw ={"chart","graph","plot","total","sum","average",
+        "count","max","min","distribution","breakdown",
+        "how many","number of","how much","avg","mean"}
+        if any (k in q_lower for k in chart_agg_kw )and sd_columns :
+            score +=1 
 
-    # Deduplicate chunks by doc_id so we fetch structured data once per doc
-    seen_doc_ids: set[str] = set()
-    candidate_docs: list[tuple[str, str, str]] = []  # (doc_id, filename, chunk_doc_id)
-    for chunk in chunks:
-        fname  = chunk.get("filename", "")
-        doc_id = chunk.get("doc_id", "")
-        if not fname:
-            continue
-        dedup_key = doc_id or fname
-        if dedup_key in seen_doc_ids:
-            continue
-        seen_doc_ids.add(dedup_key)
-        candidate_docs.append((doc_id, fname))
+        if any (k in q_lower for k in _STRUCTURED_KEYWORDS )and sd_columns :
+            score +=1 
+        return score 
 
-    # Collect all docs with relevant structured data
-    relevant_sds: list[tuple[str, dict, int]] = []  # (filename, sd, score)
-    for doc_id, fname in candidate_docs:
-        # FIX: pass doc_id to get_structured_data to prevent filename collision
-        sd = table_svc.get_structured_data(fname, session_id=session_id, doc_id=doc_id)
-        if not sd:
-            continue
-        score = _sd_relevance_score(sd, fname)
-        logging.info("run_rag_pipeline: structured data '%s' (doc_id=%s) score=%d", fname, doc_id, score)
-        if score > 0:
-            relevant_sds.append((fname, sd, score))
+    seen_doc_ids :set [str ]=set ()
+    candidate_docs :list [tuple [str ,str ,str ]]=[]
+    for chunk in chunks :
+        fname =chunk .get ("filename","")
+        doc_id =chunk .get ("doc_id","")
+        if not fname :
+            continue 
+        dedup_key =doc_id or fname 
+        if dedup_key in seen_doc_ids :
+            continue 
+        seen_doc_ids .add (dedup_key )
+        candidate_docs .append ((doc_id ,fname ))
 
-    # Build merged structured data if we have any relevant docs
-    stored_sd: dict | None = None
-    if relevant_sds:
-        if len(relevant_sds) == 1:
-            # Single doc — use as-is (no _source column needed, preserves existing behaviour)
-            stored_sd = relevant_sds[0][1]
-            logging.info("run_rag_pipeline: single structured doc '%s'", relevant_sds[0][0])
-        else:
-            # Multiple docs — merge into one with _source column (FIX: was silently dropping all but best)
-            stored_sd = _merge_structured_data(relevant_sds)
-            logging.info("run_rag_pipeline: merged %d structured docs", len(relevant_sds))
+    relevant_sds :list [tuple [str ,dict ,int ]]=[]
+    for doc_id ,fname in candidate_docs :
 
-    if not relevant_sds:
-        logging.info("run_rag_pipeline: no relevant structured data — using prose RAG")
+        sd =table_svc .get_structured_data (fname ,session_id =session_id ,doc_id =doc_id )
+        if not sd :
+            continue 
+        score =_sd_relevance_score (sd ,fname )
+        logging .info ("run_rag_pipeline: structured data '%s' (doc_id=%s) score=%d",fname ,doc_id ,score )
+        if score >0 :
+            relevant_sds .append ((fname ,sd ,score ))
 
-    # ── Step 5: Intent classification ────────────────────────────────────
-    intent = classify_intent(query, has_structured_data=stored_sd is not None)
-    logging.info("run_rag_pipeline: intent=%s has_sd=%s", intent, stored_sd is not None)
+    stored_sd :dict |None =None 
+    if relevant_sds :
+        if len (relevant_sds )==1 :
 
-    # ── Step 6: Route to structured engine or prose RAG ──────────────────
-    if intent == "structured" and stored_sd:
-        from services.query_engine import generate_plan, execute_plan, structured_to_df
+            stored_sd =relevant_sds [0 ][1 ]
+            logging .info ("run_rag_pipeline: single structured doc '%s'",relevant_sds [0 ][0 ])
+        else :
 
-        def _run_engine_local(query: str, structured: dict) -> dict | None:
-            try:
-                df = structured_to_df(structured)
-                if df.empty:
-                    return None
-                # Keep _source column if present (cross-doc merge marker)
-                drop_cols = [c for c in df.columns if c.startswith("_") and c != "_source"]
-                df = df.drop(columns=drop_cols, errors="ignore")
-                cols   = list(df.columns)
-                plan   = generate_plan(query, cols)
-                result = execute_plan(df, plan)
-                return result
-            except Exception as exc:
-                logging.warning("_run_engine_local failed: %s", exc)
-                return None
+            stored_sd =_merge_structured_data (relevant_sds )
+            logging .info ("run_rag_pipeline: merged %d structured docs",len (relevant_sds ))
 
-        engine_result = _run_engine_local(query, stored_sd)
-        if engine_result and engine_result.get("type") != "error":
-            rows = engine_result.get("rows", [])
-            if rows or engine_result.get("type") == "text":
-                if engine_result.get("type") != "chart":
-                    from services.query_engine import promote_to_chart
-                    try:
-                        df   = structured_to_df(stored_sd)
-                        drop_cols = [c for c in df.columns if c.startswith("_") and c != "_source"]
-                        df   = df.drop(columns=drop_cols, errors="ignore")
-                        cols = list(df.columns)
-                        plan = generate_plan(query, cols)
-                        if any(k in query.lower() for k in _CHART_KEYWORDS) and plan.get("group_by"):
-                            engine_result = promote_to_chart(engine_result, query)
-                    except Exception:
-                        pass
-                if engine_result.get("type") == "chart" and engine_result.get("labels"):
-                    engine_result = _clean_chart_data(engine_result, user_query=query)
-                result = {k: v for k, v in engine_result.items() if k != "sources"}
-                _cache_result(cache_key, result)
-                return result
-        logging.info("run_rag_pipeline: structured engine failed — falling back to prose RAG")
+    if not relevant_sds :
+        logging .info ("run_rag_pipeline: no relevant structured data — using prose RAG")
 
-    # ── Step 7: Contextual compression ───────────────────────────────────
-    if use_compression and len(chunks) > 2:
-        compressed_chunks = compress_chunks(query, chunks)
-    else:
-        compressed_chunks = chunks
+    intent =classify_intent (query ,has_structured_data =stored_sd is not None )
+    logging .info ("run_rag_pipeline: intent=%s has_sd=%s",intent ,stored_sd is not None )
 
-    # ── Step 8: Grounded generation — inject history for multi-turn context ──
-    if intent == "hybrid":
-        response_format = "table"
-    elif any(k in q_lower for k in _CHART_KEYWORDS):
-        response_format = "chart"
-    elif any(k in q_lower for k in _TABLE_KEYWORDS):
-        response_format = "table"
-    else:
-        response_format = "text"
+    if intent =="structured"and stored_sd :
+        from services .query_engine import generate_plan ,execute_plan ,structured_to_df 
 
-    result = grounded_generate(
-        query           = query,
-        chunks          = compressed_chunks,
-        response_format = response_format,
-        history         = history,
+        def _run_engine_local (query :str ,structured :dict )->dict |None :
+            try :
+                df =structured_to_df (structured )
+                if df .empty :
+                    return None 
+
+                drop_cols =[c for c in df .columns if c .startswith ("_")and c !="_source"]
+                df =df .drop (columns =drop_cols ,errors ="ignore")
+                cols =list (df .columns )
+                plan =generate_plan (query ,cols )
+                result =execute_plan (df ,plan )
+                return result 
+            except Exception as exc :
+                logging .warning ("_run_engine_local failed: %s",exc )
+                return None 
+
+        engine_result =_run_engine_local (query ,stored_sd )
+        if engine_result and engine_result .get ("type")!="error":
+            rows =engine_result .get ("rows",[])
+            if rows or engine_result .get ("type")=="text":
+                if engine_result .get ("type")!="chart":
+                    from services .query_engine import promote_to_chart 
+                    try :
+                        df =structured_to_df (stored_sd )
+                        drop_cols =[c for c in df .columns if c .startswith ("_")and c !="_source"]
+                        df =df .drop (columns =drop_cols ,errors ="ignore")
+                        cols =list (df .columns )
+                        plan =generate_plan (query ,cols )
+                        if any (k in query .lower ()for k in _CHART_KEYWORDS )and plan .get ("group_by"):
+                            engine_result =promote_to_chart (engine_result ,query )
+                    except Exception :
+                        pass 
+                if engine_result .get ("type")=="chart"and engine_result .get ("labels"):
+                    engine_result =_clean_chart_data (engine_result ,user_query =query )
+                result ={k :v for k ,v in engine_result .items ()if k !="sources"}
+                _cache_result (cache_key ,result )
+                return result 
+        logging .info ("run_rag_pipeline: structured engine failed — falling back to prose RAG")
+
+    if use_compression and len (chunks )>2 :
+        compressed_chunks =compress_chunks (query ,chunks )
+    else :
+        compressed_chunks =chunks 
+
+    if intent =="hybrid":
+        response_format ="table"
+    elif any (k in q_lower for k in _CHART_KEYWORDS ):
+        response_format ="chart"
+    elif any (k in q_lower for k in _TABLE_KEYWORDS ):
+        response_format ="table"
+    else :
+        response_format ="text"
+
+    result =grounded_generate (
+    query =query ,
+    chunks =compressed_chunks ,
+    response_format =response_format ,
+    history =history ,
     )
 
-    # ── Step 9: Cache and return ──────────────────────────────────────────
-    _cache_result(cache_key, result)
-    return result
+    _cache_result (cache_key ,result )
+    return result 
 
-
-def _merge_structured_data(docs: list[tuple[str, dict, int]]) -> dict:
+def _merge_structured_data (docs :list [tuple [str ,dict ,int ]])->dict :
     """
     Merge structured data from multiple documents into a single dict.
     Adds a '_source' column with the filename so the query engine and user
@@ -958,45 +850,44 @@ def _merge_structured_data(docs: list[tuple[str, dict, int]]) -> dict:
     docs: list of (filename, structured_data, score) — sorted by score desc.
     Returns a merged structured_data dict with 'rows' and 'columns'.
     """
-    from services.query_engine import structured_to_df
-    import pandas as pd
+    from services .query_engine import structured_to_df 
+    import pandas as pd 
 
-    docs_sorted = sorted(docs, key=lambda x: x[2], reverse=True)
-    frames = []
-    for fname, sd, _ in docs_sorted:
-        try:
-            df = structured_to_df(sd)
-            if df.empty:
-                continue
-            # Drop internal columns except keep schema markers out
-            df = df.drop(columns=[c for c in df.columns if c.startswith("_")], errors="ignore")
-            df["_source"] = fname
-            frames.append(df)
-        except Exception as exc:
-            logging.warning("_merge_structured_data: failed to convert '%s': %s", fname, exc)
+    docs_sorted =sorted (docs ,key =lambda x :x [2 ],reverse =True )
+    frames =[]
+    for fname ,sd ,_ in docs_sorted :
+        try :
+            df =structured_to_df (sd )
+            if df .empty :
+                continue 
 
-    if not frames:
+            df =df .drop (columns =[c for c in df .columns if c .startswith ("_")],errors ="ignore")
+            df ["_source"]=fname 
+            frames .append (df )
+        except Exception as exc :
+            logging .warning ("_merge_structured_data: failed to convert '%s': %s",fname ,exc )
+
+    if not frames :
         return {}
 
-    merged = pd.concat(frames, ignore_index=True, sort=False)
-    # Fill NaN with None for JSON serialisation
-    merged = merged.where(pd.notnull(merged), None)
+    merged =pd .concat (frames ,ignore_index =True ,sort =False )
+
+    merged =merged .where (pd .notnull (merged ),None )
 
     return {
-        "rows":    merged.to_dict(orient="records"),
-        "columns": list(merged.columns),
-        "_merged": True,
-        "_sources": [f for f, _, _ in docs_sorted],
+    "rows":merged .to_dict (orient ="records"),
+    "columns":list (merged .columns ),
+    "_merged":True ,
+    "_sources":[f for f ,_ ,_ in docs_sorted ],
     }
 
-
-def _cache_result(key: str, result: dict) -> None:
+def _cache_result (key :str ,result :dict )->None :
     """Cache result with TTL and LRU eviction."""
-    import time as _time
-    global _pipeline_cache
-    _pipeline_cache[key] = (result, _time.time())
-    if len(_pipeline_cache) > _MAX_CACHE_SIZE:
-        # Evict oldest 30 entries
-        keys_to_evict = list(_pipeline_cache.keys())[:30]
-        for k in keys_to_evict:
-            _pipeline_cache.pop(k, None)
+    import time as _time 
+    global _pipeline_cache 
+    _pipeline_cache [key ]=(result ,_time .time ())
+    if len (_pipeline_cache )>_MAX_CACHE_SIZE :
+
+        keys_to_evict =list (_pipeline_cache .keys ())[:30 ]
+        for k in keys_to_evict :
+            _pipeline_cache .pop (k ,None )
